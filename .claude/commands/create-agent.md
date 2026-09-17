@@ -73,12 +73,14 @@ Check which documentation sources are available. Try each in order — use the f
 |---|---|---|---|
 | Agno | `search_agno` MCP tool | `query_docs_filesystem_agno` MCP tool | `WebFetch https://docs.agno.com/llms-full.txt` |
 | LangGraph | `search_docs_by_lang_chain` MCP tool | `query_docs_filesystem_docs_by_lang_chain` MCP tool | `WebFetch https://langchain-ai.github.io/langgraph/llms.txt` |
-| Google ADK | `WebFetch https://google.github.io/adk-docs/llms.txt` | `WebSearch "google adk site:google.github.io/adk-docs"` | training data only |
+| Google ADK | Context7 MCP tool (`resolve-library-id` → `query-docs`, library `/google/adk-python`) | `WebFetch https://google.github.io/adk-docs/llms.txt` | `WebSearch "google adk site:google.github.io/adk-docs"` |
 | CrewAI | `search_crewai` MCP tool | `WebFetch https://docs.crewai.com/llms.txt` | `WebSearch "crewai site:docs.crewai.com"` |
 
 Record which source is available — you will use it throughout Phase 1 Research.
 
-**If no docs source is available for Agno, LangGraph, or CrewAI**, warn:
+Google ADK has no framework-dedicated MCP server. Context7 is a general-purpose docs MCP that covers it (and any other library) — try it before falling back to WebFetch.
+
+**If no docs source is available for Agno, LangGraph, CrewAI, or Google ADK**, warn:
 ```
 ⚠ No documentation source available for [framework].
   Generated code will be based on training data and may use outdated APIs.
@@ -92,6 +94,9 @@ Record which source is available — you will use it throughout Phase 1 Research
 
   CrewAI:
     "crewai-docs": { "type": "http", "url": "https://docs.crewai.com/mcp" }
+
+  Google ADK (no dedicated server — Context7 covers it generally):
+    "context7": { "type": "http", "url": "https://mcp.context7.com/mcp" }
 
   Continuing — manually verify all imports against your installed version.
 ```

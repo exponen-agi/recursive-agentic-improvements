@@ -1,6 +1,6 @@
 # Google ADK Chatbot — Create New Agent
 
-<!-- Validated against: google-adk==2.8.0 — 2026-09-10 -->
+<!-- Validated against: google-adk==2.9.1 — 2026-09-17 -->
 
 Create a stateful conversational agent using Google's Agent Development Kit (ADK). ADK is optimised for Gemini models but supports any provider through LiteLLM.
 

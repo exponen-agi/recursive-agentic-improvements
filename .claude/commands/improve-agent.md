@@ -78,7 +78,7 @@ For the chosen framework, attempt to call the MCP tool below. If available, use 
 |---|---|
 | Agno | `search_agno` or `query_docs_filesystem_agno` |
 | LangGraph | `search_docs_by_lang_chain` or `query_docs_filesystem_docs_by_lang_chain` |
-| Google ADK | WebFetch `https://google.github.io/adk-docs/llms.txt` |
+| Google ADK | Context7 MCP tool (library `/google/adk-python`), then WebFetch `https://google.github.io/adk-docs/llms.txt` |
 | CrewAI | `search_crewai` MCP tool, then WebFetch `https://docs.crewai.com/llms.txt` |
 
 **If the Agno MCP tool is not available**, output:
@@ -123,7 +123,21 @@ For the chosen framework, attempt to call the MCP tool below. If available, use 
   Then restart Claude Code. Falling back to WebFetch docs.
 ```
 
-For Google ADK: if WebFetch is unavailable, note that fix suggestions will be based on training data only.
+**If the Context7 MCP tool is not available for Google ADK** (it has no dedicated docs MCP server), output:
+```
+⚠ Context7 docs MCP not detected (this is the general-purpose MCP that covers Google ADK).
+  Fix diagnostics may use outdated Google ADK APIs.
+  To enable: add to .claude/settings.json under "mcpServers":
+
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
+    }
+
+  Then restart Claude Code. Falling back to WebFetch docs.
+```
+
+For Google ADK: if both Context7 and WebFetch are unavailable, note that fix suggestions will be based on training data only.
 
 ---
 

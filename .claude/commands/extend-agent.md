@@ -55,10 +55,12 @@ Try each in order for the chosen framework — use the first that succeeds:
 |---|---|---|---|
 | Agno | `search_agno` MCP tool | `query_docs_filesystem_agno` MCP tool | `WebFetch https://docs.agno.com/llms-full.txt` |
 | LangGraph | `search_docs_by_lang_chain` MCP tool | `query_docs_filesystem_docs_by_lang_chain` MCP tool | `WebFetch https://langchain-ai.github.io/langgraph/llms.txt` |
-| Google ADK | `WebFetch https://google.github.io/adk-docs/llms.txt` | `WebSearch "google adk [capability]"` | training data only |
+| Google ADK | Context7 MCP tool (library `/google/adk-python`) | `WebFetch https://google.github.io/adk-docs/llms.txt` | `WebSearch "google adk [capability]"` |
 | CrewAI | `search_crewai` MCP tool | `WebFetch https://docs.crewai.com/llms.txt` | `WebSearch "crewai [capability]"` |
 
-**If no docs source is available for Agno, LangGraph, or CrewAI**, warn the user:
+Google ADK has no framework-dedicated MCP server. Context7 is a general-purpose docs MCP that covers it — try it before falling back to WebFetch.
+
+**If no docs source is available for Agno, LangGraph, CrewAI, or Google ADK**, warn the user:
 ```
 ⚠ No documentation source available for [framework].
   /extend-agent relies heavily on current API docs — generated code may use
@@ -68,6 +70,7 @@ Try each in order for the chosen framework — use the first that succeeds:
     Agno:    "agno-docs":     { "type": "http", "url": "https://docs.agno.com/mcp" }
     LangGraph: "langchain-docs": { "type": "http", "url": "https://docs.langchain.com/mcp" }
     CrewAI:  "crewai-docs":   { "type": "http", "url": "https://docs.crewai.com/mcp" }
+    Google ADK: "context7":   { "type": "http", "url": "https://mcp.context7.com/mcp" }
 
   Continue without live docs (verify all generated imports manually)?
 ```

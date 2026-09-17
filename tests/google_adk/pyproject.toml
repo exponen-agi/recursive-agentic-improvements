@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Showcase and testing suite for Google ADK"
 requires-python = ">=3.11"
 dependencies = [
-    "google-adk==2.8.0",
+    "google-adk==2.9.1",
     "pytest",
     "pytest-asyncio",
 ]
