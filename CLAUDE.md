@@ -253,10 +253,16 @@ This repo has no runtime dependencies. The skills are Markdown files that Claude
     "crewai-docs": {
       "type": "http",
       "url": "https://docs.crewai.com/mcp"
+    },
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
     }
   }
 }
 ```
+
+`context7` is a general-purpose docs MCP (library ID `/google/adk-python`) and is the recommended way to cover Google ADK, which has no dedicated docs MCP server of its own.
 
 Restart Claude Code after adding MCP servers.
 
@@ -588,7 +594,7 @@ Update this table whenever a framework is added, removed, or a minimum version c
 | Agno | 2.9.0 | MCP + llms-full.txt | `https://docs.agno.com/mcp` | Use `Claude(id=...)` for Anthropic models |
 | CrewAI | 1.15.17 | MCP + llms.txt | `https://docs.crewai.com/mcp` | `crewai create crew <slug>` to scaffold |
 | LangGraph | 1.2.11 | MCP + llms.txt | `https://docs.langchain.com/mcp` | `create_react_agent` moved to `langchain.agents.create_agent` (V1.0+); requires `LANGSMITH_API_KEY` for tracing |
-| Google ADK | 2.8.0 | WebFetch llms.txt | No MCP server | `root_agent` must be defined in `agent.py` |
+| Google ADK | 2.9.1 | Context7 (`/google/adk-python`) + WebFetch llms.txt | `https://mcp.context7.com/mcp` (general-purpose, no ADK-dedicated server exists) | `root_agent` must be defined in `agent.py` |
 
 ---
 

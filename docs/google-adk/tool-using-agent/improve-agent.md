@@ -1,6 +1,6 @@
 # Google ADK Tool-Using Agent — Improve Agent
 
-<!-- Validated against: google-adk==2.8.0 — 2026-09-10 -->
+<!-- Validated against: google-adk==2.9.1 — 2026-09-17 -->
 
 Harden a tool-using ADK agent against incorrect tool call sequences, missing confirmations, and poor error handling.
 

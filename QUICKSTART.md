@@ -123,11 +123,15 @@ To allow Claude Code to inspect the latest framework documentation live, add the
     "crewai-docs": {
       "type": "http",
       "url": "https://docs.crewai.com/mcp"
+    },
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
     }
   }
 }
 ```
-*Restart Claude Code after saving the config.*
+*Restart Claude Code after saving the config.* `context7` is a general-purpose docs MCP — it's what covers Google ADK, since ADK has no dedicated MCP server of its own.
 
 ---
 
