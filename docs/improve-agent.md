@@ -66,6 +66,8 @@ For each probe, record:
 - **Expected behaviour**: what a passing response looks like
 - **Pass criterion**: how to judge PASS vs FAIL (exact match, contains keyword, tool was called, etc.)
 
+If a probe's quality (tone, reasoning, helpfulness) can't be reduced to a simple match rule, add an LLM-as-judge score as a secondary note — it informs the fix but never replaces the deterministic Pass Criterion; every probe still needs a binary PASS/FAIL.
+
 ### Phase C — Run Probes
 
 For each probe:

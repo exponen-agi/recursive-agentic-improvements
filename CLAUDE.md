@@ -145,6 +145,8 @@ flowchart TD
 
 An interactive version of this diagram is on the [live landing page, "Fallback Chain" section](https://cloudbloqavi.github.io/recursive-agentic-improvements/#fallback).
 
+**Note on MCP transport:** the MCP spec's 2026-07-28 revision moved the default transport to stateless streamable HTTP. A server built before that revision may stop responding under a client that assumes the new default. Treat a server that errors or times out as "unavailable" and fall through to the next step in the chain — do not treat it as a hard blocker.
+
 ### 4. No domain hardcoding in skills
 
 Skills handle **any domain** through dynamic research. Do not add:
@@ -266,7 +268,7 @@ This repo has no runtime dependencies. The skills are Markdown files that Claude
 
 Restart Claude Code after adding MCP servers.
 
-**Discovering MCP servers for a new framework:** check the official [MCP Registry](https://registry.modelcontextprotocol.io) first — it is the community-maintained, searchable index of public MCP servers (launched Sept 2025) and is faster to check than guessing a docs-site URL. Only fall back to a manual `llms.txt`/`llms-full.txt` search when the registry has no entry for the framework.
+**Discovering MCP servers for a new framework:** check the official [MCP Registry](https://registry.modelcontextprotocol.io) first — it is the community-maintained, searchable index of public MCP servers (launched Sept 2025) and is faster to check than guessing a docs-site URL. Only fall back to a manual `llms.txt`/`llms-full.txt` search when the registry has no entry for the framework. The registry has grown quickly and includes entries that are dead or unmaintained — before wiring a server into `.claude/settings.json`, confirm it actually responds (a real tool call, or its docs/health page), not just that it is listed.
 
 **No build step, no linter, no test runner for this repo itself.** Testing is end-to-end: install the skill into a live project and run it.
 
@@ -594,7 +596,9 @@ Update this table whenever a framework is added, removed, or a minimum version c
 | Agno | 2.9.0 | MCP + llms-full.txt | `https://docs.agno.com/mcp` | Use `Claude(id=...)` for Anthropic models |
 | CrewAI | 1.15.17 | MCP + llms.txt | `https://docs.crewai.com/mcp` | `crewai create crew <slug>` to scaffold |
 | LangGraph | 1.2.11 | MCP + llms.txt | `https://docs.langchain.com/mcp` | `create_react_agent` moved to `langchain.agents.create_agent` (V1.0+); requires `LANGSMITH_API_KEY` for tracing |
-| Google ADK | 2.9.1 | Context7 (`/google/adk-python`) + WebFetch llms.txt | `https://mcp.context7.com/mcp` (general-purpose, no ADK-dedicated server exists) | `root_agent` must be defined in `agent.py` |
+| Google ADK | 2.9.1 | Context7 (`/google/adk-python`) + WebFetch llms.txt | `https://mcp.context7.com/mcp` (general-purpose, no ADK-dedicated server exists) | `root_agent` must be defined in `agent.py`; ADK 1.0+ also supports the A2A (Agent2Agent) protocol natively for cross-framework agent-to-agent calls |
+
+**Frameworks evaluated and intentionally not included:** AutoGen (its upstream project is in maintenance mode after merging into Microsoft Agent Framework 1.0 — see the community fork AG2 if you specifically need that lineage) and smolagents / Pydantic AI (real adoption for small, single-file agents, but not yet at the multi-file scaffold parity this repo's skills assume). Re-evaluate against "Adding a New Framework" above if adoption data changes.
 
 ---
 

@@ -139,6 +139,8 @@ For the chosen framework, attempt to call the MCP tool below. If available, use 
 
 For Google ADK: if both Context7 and WebFetch are unavailable, note that fix suggestions will be based on training data only.
 
+The MCP spec's 2026-07-28 revision moved the default transport to stateless streamable HTTP. If a configured MCP server errors or times out, treat it as unavailable and fall through to the next source rather than treating it as a hard blocker.
+
 ---
 
 ## Step 4 — Derive 10 Probes
@@ -163,6 +165,8 @@ Pass Criterion: CONTAINS "<keyword>" | TOOL_CALLED "<name>" | NOT_CONTAINS "<bad
 Result: PASS / FAIL
 Notes: <what actually happened>
 ```
+
+If a probe's quality (tone, reasoning, helpfulness) cannot be reduced to CONTAINS/TOOL_CALLED/NOT_CONTAINS/FORMAT_OK, add an LLM-as-judge score (0-1, with the judge's reasoning) as a secondary note on that probe. It informs the fix — it never replaces the deterministic Pass Criterion, since Success Criteria still require a binary PASS/FAIL on all 10 probes.
 
 ---
 
