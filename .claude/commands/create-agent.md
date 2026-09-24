@@ -80,6 +80,8 @@ Record which source is available — you will use it throughout Phase 1 Research
 
 Google ADK has no framework-dedicated MCP server. Context7 is a general-purpose docs MCP that covers it (and any other library) — try it before falling back to WebFetch.
 
+The MCP spec's 2026-07-28 revision moved the default transport to stateless streamable HTTP. If a configured MCP server errors or times out, treat it as unavailable and move to the next step in the chain rather than treating it as a hard blocker.
+
 **If no docs source is available for Agno, LangGraph, CrewAI, or Google ADK**, warn:
 ```
 ⚠ No documentation source available for [framework].
@@ -149,6 +151,20 @@ Based on the user's description, determine the right agent architecture:
 | Multi-step pipeline with roles | `Agent` + `Team` | Multi-`@agent` crew | `StateGraph` with nodes | `LlmAgent` with sub-agents |
 | Supervisor + specialists | `Agent` + `Team(mode="coordinate")` | Hierarchical `Process` | Supervisor + sub-graphs | Orchestrator + sub-agents |
 | Pure tool execution | `Agent` with tools | `@agent` with tools | `ToolNode` in graph | `LlmAgent` with function tools |
+
+For "Supervisor + specialists", keep the specialist count deliberate:
+
+```
+Supervisor
+ ├─> Specialist 1 ──┐
+ ├─> Specialist 2 ──┤
+ ├─> Specialist 3 ──┼──> all report back into ONE supervisor context
+ └─> Specialist 4 ──┘
+
+4+ specialists reporting into one supervisor risks overflowing its context
+window. If the domain needs more, nest a second supervisor layer instead
+of one flat fan-out.
+```
 
 Search docs to confirm the correct class and parameters for the chosen architecture.
 

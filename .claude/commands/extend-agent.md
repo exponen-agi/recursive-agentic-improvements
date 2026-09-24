@@ -60,6 +60,8 @@ Try each in order for the chosen framework — use the first that succeeds:
 
 Google ADK has no framework-dedicated MCP server. Context7 is a general-purpose docs MCP that covers it — try it before falling back to WebFetch.
 
+The MCP spec's 2026-07-28 revision moved the default transport to stateless streamable HTTP. If a configured MCP server errors or times out, treat it as unavailable and fall through to the next source rather than treating it as a hard blocker.
+
 **If no docs source is available for Agno, LangGraph, CrewAI, or Google ADK**, warn the user:
 ```
 ⚠ No documentation source available for [framework].
