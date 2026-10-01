@@ -136,7 +136,7 @@ from src.<slug>.tools import web_search, calculator  # your tools
 SYSTEM_PROMPT = """..."""  # from Step 3
 
 # Model
-model = init_chat_model("claude-sonnet-4-6", model_provider="anthropic")
+model = init_chat_model("claude-sonnet-5-5", model_provider="anthropic")
 
 # Tools
 tools = [web_search, calculator]
@@ -165,7 +165,7 @@ from langgraph.prebuilt import ToolNode
 class State(TypedDict):
     messages: Annotated[list, add_messages]
 
-model = init_chat_model("claude-sonnet-4-6", model_provider="anthropic")
+model = init_chat_model("claude-sonnet-5-5", model_provider="anthropic")
 model_with_tools = model.bind_tools(tools)
 
 def should_continue(state: State) -> Literal["tools", "__end__"]:

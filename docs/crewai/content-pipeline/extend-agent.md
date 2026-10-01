@@ -29,7 +29,7 @@ seo_specialist:
     You know that good SEO in 2026 means genuinely useful content with natural
     keyword placement, strong headings, and clear meta descriptions.
     You never keyword-stuff. You add SEO value without hurting readability.
-  llm: anthropic/claude-sonnet-4-6
+  llm: anthropic/claude-sonnet-5-5
 ```
 
 ```yaml
@@ -66,7 +66,7 @@ social_media_writer:
     You know LinkedIn rewards professional insights, Twitter/X rewards brevity and controversy,
     and Instagram rewards visual hooks. You adapt the same core message to each platform's
     culture and format constraints.
-  llm: anthropic/claude-sonnet-4-6
+  llm: anthropic/claude-sonnet-5-5
 ```
 
 ```yaml

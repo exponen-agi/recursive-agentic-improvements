@@ -348,7 +348,7 @@ INSTRUCTIONS = """[Full INSTRUCTIONS from blueprint Phase 2a]"""
 
 agent = Agent(
     name="[AgentName from blueprint]",
-    model=Claude(id="claude-sonnet-4-6"),
+    model=Claude(id="claude-sonnet-5-5"),
     instructions=INSTRUCTIONS,
     tools=[
         [all tools from blueprint — native + custom]
@@ -414,7 +414,7 @@ cd <slug>
     [backstory shaped to the domain — include domain expertise and quality constraints]
   verbose: true
   allow_delegation: false
-  llm: anthropic/claude-sonnet-4-6
+  llm: anthropic/claude-sonnet-5-5
 ```
 
 **tasks.yaml** — one task per agent role from blueprint. For each:
@@ -520,7 +520,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from src.<slug>.tools import [all tools from blueprint]
 
 SYSTEM_PROMPT = """[From blueprint]"""
-model = init_chat_model("claude-sonnet-4-6", model_provider="anthropic")
+model = init_chat_model("claude-sonnet-5-5", model_provider="anthropic")
 graph = create_agent(model=model, tools=[...], system_prompt=SYSTEM_PROMPT,
                      checkpointer=InMemorySaver())
 ```
@@ -613,7 +613,7 @@ INSTRUCTION = """[From blueprint]"""
 
 root_agent = LlmAgent(
     name="<slug>",
-    model="gemini-2.5-flash",  # or "anthropic/claude-sonnet-4-6"
+    model="gemini-2.5-flash",  # or "anthropic/claude-sonnet-5-5"
     instruction=INSTRUCTION,
     tools=[all tools from blueprint],
 )

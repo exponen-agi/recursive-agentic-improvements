@@ -33,7 +33,7 @@ fact_checker:
     evidence as actively as confirming evidence. You never pass a report that
     contains unverified statistics or broken source links.
   verbose: true
-  llm: anthropic/claude-sonnet-4-6
+  llm: anthropic/claude-sonnet-5-5
 ```
 
 **In `config/tasks.yaml`:**
@@ -92,7 +92,7 @@ def crew(self) -> Crew:
         agents=self.agents,
         tasks=self.tasks,
         process=Process.hierarchical,
-        manager_llm="anthropic/claude-sonnet-4-6",
+        manager_llm="anthropic/claude-sonnet-5-5",
         verbose=True,
     )
 ```
