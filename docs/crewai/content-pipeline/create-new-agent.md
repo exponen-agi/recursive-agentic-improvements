@@ -59,7 +59,7 @@ content_strategist:
     You write briefs that give writers clear direction without restricting their creativity.
   verbose: true
   allow_delegation: false
-  llm: anthropic/claude-sonnet-4-6
+  llm: anthropic/claude-sonnet-5-5
 
 copywriter:
   role: >
@@ -74,7 +74,7 @@ copywriter:
     hook that makes the reader want to continue. You follow the outline given to you.
   verbose: true
   allow_delegation: false
-  llm: anthropic/claude-sonnet-4-6
+  llm: anthropic/claude-sonnet-5-5
 
 editor:
   role: >
@@ -90,7 +90,7 @@ editor:
     and an actual error.
   verbose: true
   allow_delegation: false
-  llm: anthropic/claude-sonnet-4-6
+  llm: anthropic/claude-sonnet-5-5
 ```
 
 ---

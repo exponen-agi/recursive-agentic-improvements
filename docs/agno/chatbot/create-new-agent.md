@@ -104,7 +104,7 @@ db = SqliteDb(db_file="tmp/<slug>.db")
 
 agent = Agent(
     name="<AgentName>",
-    model=Claude(id="claude-sonnet-4-6"),
+    model=Claude(id="claude-sonnet-5-5"),
     instructions=INSTRUCTIONS,
     db=db,                          # enables session persistence
     add_history_to_context=True,    # injects past messages into context

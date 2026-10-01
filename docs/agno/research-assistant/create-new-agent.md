@@ -98,7 +98,7 @@ db = SqliteDb(db_file="tmp/<slug>.db")
 
 agent = Agent(
     name="<AgentName>ResearchAssistant",
-    model=Claude(id="claude-sonnet-4-6"),
+    model=Claude(id="claude-sonnet-5-5"),
     instructions=INSTRUCTIONS,
     tools=[
         DuckDuckGoTools(),

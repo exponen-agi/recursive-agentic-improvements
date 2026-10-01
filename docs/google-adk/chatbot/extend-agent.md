@@ -143,7 +143,7 @@ Switch to Claude or another provider:
 ```python
 root_agent = LlmAgent(
     name="<agent_slug>",
-    model="anthropic/claude-sonnet-4-6",   # LiteLLM format
+    model="anthropic/claude-sonnet-5-5",   # LiteLLM format
     instruction=INSTRUCTION,
     tools=[get_current_time, search_web],
 )

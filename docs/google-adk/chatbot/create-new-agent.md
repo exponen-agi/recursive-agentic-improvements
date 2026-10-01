@@ -160,7 +160,7 @@ root_agent = LlmAgent(
         search_web,
     ],
     # Optional: for non-Gemini models via LiteLLM:
-    # model="anthropic/claude-sonnet-4-6",
+    # model="anthropic/claude-sonnet-5-5",
 )
 ```
 
@@ -170,7 +170,7 @@ root_agent = LlmAgent(
 |---|---|---|---|
 | `gemini-2.5-flash` | Fast | Low | Good for chatbots |
 | `gemini-2.5-pro` | Medium | Higher | Best for complex reasoning |
-| `anthropic/claude-sonnet-4-6` | Medium | Medium | Excellent instruction following |
+| `anthropic/claude-sonnet-5-5` | Medium | Medium | Excellent instruction following |
 
 ---
 

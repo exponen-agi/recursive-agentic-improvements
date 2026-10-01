@@ -146,7 +146,7 @@ from agents.<slug>.agent import agent
 
 # Accuracy eval
 accuracy = AccuracyEval(
-    model=Claude(id="claude-sonnet-4-6"),
+    model=Claude(id="claude-sonnet-5-5"),
     agent=agent,
     input="<golden_path_input>",
     expected_output="<expected_content>",

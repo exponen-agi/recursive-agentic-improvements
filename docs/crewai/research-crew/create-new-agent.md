@@ -79,7 +79,7 @@ senior_researcher:
     you have not verified. You are thorough, methodical, and sceptical by default.
   verbose: true
   allow_delegation: false
-  llm: anthropic/claude-sonnet-4-6
+  llm: anthropic/claude-sonnet-5-5
 
 reporting_analyst:
   role: >
@@ -94,7 +94,7 @@ reporting_analyst:
     You never add information not present in the research you receive.
   verbose: true
   allow_delegation: false
-  llm: anthropic/claude-sonnet-4-6
+  llm: anthropic/claude-sonnet-5-5
 ```
 
 **Critical YAML guidelines:**

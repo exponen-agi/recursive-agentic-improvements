@@ -522,7 +522,7 @@ chore(install): add --dry-run flag to PowerShell installer
 - **Do not list specific third-party tools for specific industries** as defaults. Research finds them.
 - **Do not skip the Research phase** for use cases you consider obvious. APIs change; live docs are authoritative.
 - **Do not remove the Blueprint confirmation gate.** Users must have the opportunity to redirect before files are created.
-- **Do not hardcode a single model as immutable.** Default to `claude-sonnet-4-6` but do not prohibit alternatives.
+- **Do not hardcode a single model as immutable.** Default to `claude-sonnet-5-5` but do not prohibit alternatives.
 - **Do not write error-recovery logic** for framework failures — emit the error to the user and stop.
 - **Do not reference `docs/`** inside a skill file. Skills are standalone.
 
@@ -593,7 +593,7 @@ Update this table whenever a framework is added, removed, or a minimum version c
 
 | Framework | Min version tested | Docs source | MCP URL | Key note |
 |---|---|---|---|---|
-| Agno | 2.9.0 | MCP + llms-full.txt | `https://docs.agno.com/mcp` | Use `Claude(id=...)` for Anthropic models |
+| Agno | 2.9.0 | MCP + llms-full.txt | `https://docs.agno.com/mcp` | Use `Claude(id=...)` for Anthropic models; Agno 3.0 renamed some toolkit/memory params but `SqliteDb` + `add_history_to_context` are unchanged (see its v2→v3 migration guide) |
 | CrewAI | 1.15.17 | MCP + llms.txt | `https://docs.crewai.com/mcp` | `crewai create crew <slug>` to scaffold |
 | LangGraph | 1.2.11 | MCP + llms.txt | `https://docs.langchain.com/mcp` | `create_react_agent` moved to `langchain.agents.create_agent` (V1.0+); requires `LANGSMITH_API_KEY` for tracing |
 | Google ADK | 2.9.1 | Context7 (`/google/adk-python`) + WebFetch llms.txt | `https://mcp.context7.com/mcp` (general-purpose, no ADK-dedicated server exists) | `root_agent` must be defined in `agent.py`; ADK 1.0+ also supports the A2A (Agent2Agent) protocol natively for cross-framework agent-to-agent calls |

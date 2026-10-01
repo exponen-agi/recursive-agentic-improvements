@@ -96,7 +96,7 @@ from agents.<slug>.agent import agent
 
 # Test against a known answer
 eval = AccuracyEval(
-    model=Claude(id="claude-sonnet-4-6"),
+    model=Claude(id="claude-sonnet-5-5"),
     agent=agent,
     input="What year was the Eiffel Tower built?",
     expected_output="1889",

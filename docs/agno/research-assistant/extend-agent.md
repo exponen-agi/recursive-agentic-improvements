@@ -133,7 +133,7 @@ data_analyst = Agent(
 research_team = Team(
     name="ResearchTeam",
     members=[web_researcher, data_analyst],
-    model=Claude(id="claude-sonnet-4-6"),
+    model=Claude(id="claude-sonnet-5-5"),
     instructions="Delegate research tasks to WebResearcher, then have DataAnalyst synthesise.",
     markdown=True,
 )

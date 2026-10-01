@@ -61,7 +61,7 @@ ls_client.create_examples(
 )
 
 # Evaluator function
-judge = init_chat_model("claude-sonnet-4-6", model_provider="anthropic")
+judge = init_chat_model("claude-sonnet-5-5", model_provider="anthropic")
 
 async def correct(outputs: dict, reference_outputs: dict) -> bool:
     """LLM-as-judge: does the actual answer satisfy the expected behaviour?"""

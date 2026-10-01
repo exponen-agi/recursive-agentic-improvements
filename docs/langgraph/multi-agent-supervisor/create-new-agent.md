@@ -88,7 +88,7 @@ def web_search(query: str) -> str:
     """
     return search.run(query)
 
-researcher_model = init_chat_model("claude-sonnet-4-6", model_provider="anthropic")
+researcher_model = init_chat_model("claude-sonnet-5-5", model_provider="anthropic")
 researcher_agent = create_agent(
     model=researcher_model,
     tools=[web_search],
@@ -129,7 +129,7 @@ Decision rules:
 Respond with ONLY ONE of: researcher, analyst, writer, FINISH
 """
 
-supervisor_model = init_chat_model("claude-sonnet-4-6", model_provider="anthropic")
+supervisor_model = init_chat_model("claude-sonnet-5-5", model_provider="anthropic")
 
 def supervisor_node(state: dict) -> dict:
     """Route to the appropriate agent."""
