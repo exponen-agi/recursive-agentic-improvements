@@ -11,7 +11,11 @@ let agentName = 'claude';
 let targetProject = process.cwd();
 
 for (let i = 0; i < args.length; i++) {
-  if ((args[i] === '--agent' || args[i] === '-a') && args[i + 1]) {
+  if (args[i] === '--agent' || args[i] === '-a') {
+    if (!args[i + 1] || args[i + 1].startsWith('-')) {
+      console.error('Error: --agent needs a value, for example: --agent cursor');
+      process.exit(1);
+    }
     agentName = args[i + 1].toLowerCase();
     i++;
   } else if (args[i] === '--help' || args[i] === '-h') {
