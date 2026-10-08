@@ -90,6 +90,21 @@ npx github:cloudbloqavi/recursive-agentic-improvements --agent antigravity  # Go
 
 The installer creates the target directory if it doesn't exist, then copies the three skills (`create-agent.md`, `improve-agent.md`, `extend-agent.md`) and `TEST_CONSTITUTION.md` into your `tests/` directory.
 
+**Manual copy (no Node.js needed)** — run from your project folder, with `<repo>` as the path to a clone of this repo:
+
+macOS / Linux (bash/zsh):
+```bash
+mkdir -p .claude/commands && cp <repo>/.claude/commands/*.md .claude/commands/
+```
+
+Windows (PowerShell):
+```powershell
+New-Item -ItemType Directory -Force .claude\commands | Out-Null
+Copy-Item <repo>\.claude\commands\*.md .claude\commands\
+```
+
+The installer needs Node.js 18 or newer.
+
 ### Step 2: Configure Environment Variables
 Copy the `.env.example` file to `.env` and fill in your API keys:
 

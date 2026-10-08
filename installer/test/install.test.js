@@ -151,3 +151,33 @@ test('running the installer twice reports [UPDATE] the second time', () => {
     cleanup(dir);
   }
 });
+
+test('--agent with no value exits with an error instead of installing silently', () => {
+  const dir = makeTmpProject();
+  try {
+    const result = runInstaller(['--agent'], dir);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /--agent needs a value/);
+    assert.ok(!fs.existsSync(path.join(dir, '.claude')));
+  } finally {
+    cleanup(dir);
+  }
+});
+
+for (const [agent, subdir] of [
+  ['copilot', path.join('.github', 'instructions')],
+  ['roo', path.join('.roo', 'rules')],
+  ['windsurf', path.join('.windsurf', 'rules')],
+  ['antigravity', path.join('.agents', 'rules')],
+]) {
+  test(`--agent ${agent} installs into ${subdir}`, () => {
+    const dir = makeTmpProject();
+    try {
+      const result = runInstaller(['--agent', agent], dir);
+      assert.equal(result.status, 0, result.stderr);
+      assert.ok(fs.existsSync(path.join(dir, subdir, 'create-agent.md')));
+    } finally {
+      cleanup(dir);
+    }
+  });
+}

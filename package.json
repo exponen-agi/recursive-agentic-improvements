@@ -12,5 +12,8 @@
   "scripts": {
     "prepare": "node installer/scripts/prepare.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "license": "MIT"
 }
