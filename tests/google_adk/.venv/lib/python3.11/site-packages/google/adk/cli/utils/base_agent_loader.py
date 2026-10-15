@@ -1,0 +1,63 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Base class for agent loaders."""
+
+from __future__ import annotations
+
+from abc import ABC
+from abc import abstractmethod
+from typing import Any
+from typing import Union
+
+from ...agents.base_agent import BaseAgent
+from ...apps.app import App
+
+
+class _AgentLoadError(RuntimeError):
+  """An agent exists but raised while loading.
+
+  Deliberately not a ValueError, which from a loader means no such agent.
+  """
+
+
+class BaseAgentLoader(ABC):
+  """Abstract base class for agent loaders."""
+
+  _allow_special_agents: bool = False
+
+  @abstractmethod
+  def load_agent(self, agent_name: str) -> Union[BaseAgent, App]:
+    """Loads an instance of an agent with the given name.
+
+    Raises:
+      ValueError: If no agent exists under this name. The API server answers
+        it with a 404.
+    """
+
+  @abstractmethod
+  def list_agents(self) -> list[str]:
+    """Lists all agents available in the agent loader in alphabetical order."""
+
+  def list_agents_detailed(self) -> list[dict[str, Any]]:
+    agent_names = self.list_agents()
+    return [
+        {
+            'name': name,
+            'display_name': None,
+            'description': None,
+            'type': None,
+        }
+        for name in agent_names
+    ]

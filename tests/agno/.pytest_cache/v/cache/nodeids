@@ -1,0 +1,8 @@
+[
+  "test_agno.py::test_add_numbers_tool_isolated",
+  "test_agno.py::test_agno_agent_constraint_refusal",
+  "test_agno.py::test_agno_agent_edge_case",
+  "test_agno.py::test_agno_agent_happy_path",
+  "test_agno.py::test_agno_agent_instructions",
+  "test_agno.py::test_agno_agent_static"
+]
