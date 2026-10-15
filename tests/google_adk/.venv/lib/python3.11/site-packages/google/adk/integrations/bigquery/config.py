@@ -1,0 +1,243 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from enum import Enum
+import re
+from typing import Optional
+
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from pydantic import field_validator
+from pydantic import model_validator
+from typing_extensions import Self
+
+
+class WriteMode(Enum):
+  """Write mode indicating what levels of write operations are allowed in BigQuery."""
+
+  BLOCKED = 'blocked'
+  """No write operations are allowed.
+
+  This mode implies that only read (i.e. SELECT query) operations are allowed.
+  """
+
+  PROTECTED = 'protected'
+  """Only protected write operations are allowed in a BigQuery session.
+
+  In this mode write operations in the anonymous dataset of a BigQuery session
+  are allowed. For example, a temporary table can be created, manipulated and
+  deleted in the anonymous dataset during Agent interaction, while protecting
+  permanent tables from being modified or deleted. A non-SELECT statement runs
+  only when a dry run places it in that anonymous dataset, so a statement the
+  dry run attributes to no destination at all, such as a script, a procedure
+  call or an export, is rejected. To learn more about BigQuery sessions, see
+  https://cloud.google.com/bigquery/docs/sessions-intro.
+  """
+
+  ALLOWED = 'allowed'
+  """All write operations are allowed."""
+
+
+class BigQueryToolConfig(BaseModel):
+  """Configuration for BigQuery tools."""
+
+  # Forbid any fields not defined in the model
+  model_config = ConfigDict(extra='forbid')
+
+  write_mode: WriteMode = WriteMode.BLOCKED
+  """Write mode for BigQuery tools.
+
+  By default, the tool will allow only read operations. This behaviour may
+  change in future versions.
+  """
+
+  maximum_bytes_billed: Optional[int] = None
+  """Maximum number of bytes to bill for a query.
+
+  In BigQuery on-demand pricing, charges are rounded up to the nearest MB, with
+  a minimum 10 MB data processed per table referenced by the query, and with a
+  minimum 10 MB data processed per query. So this value must be set >=10485760.
+  """
+
+  max_query_result_rows: int = 50
+  """Maximum number of rows to return from a query.
+
+  By default, the query result will be limited to 50 rows.
+  """
+
+  application_name: Optional[str] = None
+  """Name of the application using the BigQuery tools.
+
+  By default, no particular application name will be set in the BigQuery
+  interaction. But if the tool user (agent builder) wants to differentiate
+  their application/agent for tracking or support purpose, they can set this
+  field. If set, this value will be added to the user_agent in BigQuery API
+  calls, and also to the BigQuery job labels with the key
+  "adk-bigquery-application-name".
+
+  Note: This field is for usage discovery and tracking purposes only and should
+  not be used for security-sensitive decisions.
+  """
+
+  compute_project_id: Optional[str] = None
+  """GCP project ID to use for the BigQuery compute operations.
+
+  This can be set as a guardrail to ensure that the tools perform the compute
+  operations (such as query execution) in a specific project.
+  """
+
+  default_project_id: Optional[str] = None
+  """GCP project ID the tools should use when the model does not name one.
+
+  Set this when the agent always works in one project. The `project_id`
+  argument then becomes optional for the model, so it no longer has to ask the
+  user for a project at the start of every conversation. The model can still
+  name a different project, subject to the `compute_project_id` guardrail.
+
+  Because the query tools run in the project they are given, this must name the
+  same project as `compute_project_id` when that guardrail is set. Leave this
+  unset to keep the data project up to the model.
+  """
+
+  default_dataset_id: Optional[str] = None
+  """BigQuery dataset ID the tools should use when the model does not name one.
+
+  Set this when the agent always works in one dataset. The `dataset_id`
+  argument then becomes optional for the model, so it no longer has to ask the
+  user for a dataset at the start of every conversation. The model can still
+  name a different dataset.
+
+  This only reaches the tools that take a `dataset_id` argument: the dataset
+  and table metadata tools. `execute_sql` and the ML tools carry the dataset in
+  the SQL text instead.
+  """
+
+  location: Optional[str] = None
+  """BigQuery location to use for the data and compute.
+
+  This can be set if the BigQuery tools are expected to process data in a
+  particular BigQuery location. If not set, then location would be automatically
+  determined based on the data location in the query. For all supported
+  locations, see https://cloud.google.com/bigquery/docs/locations.
+  """
+
+  job_labels: Optional[dict[str, str]] = None
+  """Labels to apply to BigQuery jobs for tracking and monitoring.
+
+  These labels will be added to all BigQuery jobs executed by the tools.
+  Labels must be key-value pairs where both keys and values are strings.
+  Labels can be used for billing, monitoring, and resource organization.
+  For more information about labels, see
+  https://cloud.google.com/bigquery/docs/labels-intro.
+
+  Note: These labels are for usage discovery and tracking purposes only and
+  should not be used for security-sensitive decisions. The number of
+  user-provided labels is restricted to 20, and keys starting with
+  "adk-bigquery-" are reserved for internal usage.
+  """
+
+  kms_key_name: Optional[str] = None
+  """Cloud KMS key to encrypt query results with (CMEK).
+
+  Set this when an organization policy such as
+  `constraints/gcp.restrictNonCmekServices` requires BigQuery query results to
+  be protected with a customer-managed key. The value is the key's resource
+  name, `projects/{project}/locations/{location}/keyRings/{key_ring}/cryptoKeys/{key}`,
+  and the key must be in the same location as the data being queried. The
+  BigQuery service agent of the project that runs the query needs the Cloud
+  KMS CryptoKey Encrypter/Decrypter role on the key.
+
+  The key is applied to SELECT statements only, because BigQuery rejects a
+  job-level key for DDL, DML, and multi-statement scripts. Under such a policy,
+  those need a project default key. A permanent table can instead take
+  `OPTIONS(kms_key_name=...)` in its CREATE statement, but a temporary table
+  cannot. With `WriteMode.ALLOWED`, setting this adds a dry run before
+  each query to find the statement type; the other write modes already dry
+  run the query. For all key options, see
+  https://cloud.google.com/bigquery/docs/customer-managed-encryption.
+  """
+
+  @field_validator('maximum_bytes_billed')
+  @classmethod
+  def validate_maximum_bytes_billed(cls, v: Optional[int]) -> Optional[int]:
+    """Validate the maximum bytes billed."""
+    if v and v < 10_485_760:
+      raise ValueError(
+          'In BigQuery on-demand pricing, charges are rounded up to the nearest'
+          ' MB, with a minimum 10 MB data processed per table referenced by the'
+          ' query, and with a minimum 10 MB data processed per query. So'
+          ' max_bytes_billed must be set >=10485760.'
+      )
+    return v
+
+  @field_validator('application_name')
+  @classmethod
+  def validate_application_name(cls, v: Optional[str]) -> Optional[str]:
+    """Validate the application name."""
+    if v and ' ' in v:
+      raise ValueError('Application name should not contain spaces.')
+    return v
+
+  @field_validator('kms_key_name')
+  @classmethod
+  def validate_kms_key_name(cls, v: Optional[str]) -> Optional[str]:
+    """Validate the Cloud KMS key resource name."""
+    if v is not None and not re.fullmatch(
+        r'projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+', v
+    ):
+      raise ValueError(
+          'kms_key_name must be a Cloud KMS key resource name of the form'
+          ' projects/{project}/locations/{location}/keyRings/{key_ring}'
+          f'/cryptoKeys/{{key}}, found "{v}".'
+      )
+    return v
+
+  @field_validator('job_labels')
+  @classmethod
+  def validate_job_labels(
+      cls, v: Optional[dict[str, str]]
+  ) -> Optional[dict[str, str]]:
+    """Validate the job labels."""
+    if v is not None:
+      if len(v) > 20:
+        raise ValueError('Only up to 20 job labels can be provided')
+      for key in v.keys():
+        if not key:
+          raise ValueError('Label keys cannot be empty.')
+        if key.startswith('adk-bigquery-'):
+          raise ValueError(
+              'Label key cannot start with "adk-bigquery-" as it is'
+              f' reserved for internal usage, found "{key}".'
+          )
+    return v
+
+  @model_validator(mode='after')
+  def validate_default_project_id(self) -> Self:
+    """Validate the default project against the compute project guardrail."""
+    if (
+        self.default_project_id
+        and self.compute_project_id
+        and self.default_project_id != self.compute_project_id
+    ):
+      raise ValueError(
+          'default_project_id'
+          f' "{self.default_project_id}" cannot differ from'
+          f' compute_project_id "{self.compute_project_id}", as the query'
+          ' tools would then default to a project the compute guardrail'
+          ' rejects. Leave default_project_id unset to let the model pick the'
+          ' data project.'
+      )
+    return self

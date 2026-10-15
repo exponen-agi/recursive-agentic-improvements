@@ -1,0 +1,345 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""GCP Skill Registry implementation."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import ssl
+import tempfile
+from typing import Any
+from urllib.parse import quote
+
+from google.adk.skills import _utils
+from google.adk.skills import models
+from google.adk.skills.skill_registry import SkillRegistry
+from google.adk.utils import _mtls_utils
+from google.adk.utils._google_client_headers import merge_tracking_headers
+import google.auth
+import google.auth.credentials
+from google.auth.credentials import Credentials
+import google.auth.exceptions
+from google.auth.transport import mtls
+from google.auth.transport import requests as auth_requests
+import httpx
+from pydantic import field_validator
+from pydantic import ValidationError
+
+logger = logging.getLogger("google_adk." + __name__)
+
+# Registry resource ids (e.g. "cloud.google.com-agent-platform-eval-flywheel"
+# for Google-published skills) are a different namespace from SKILL.md
+# frontmatter names: they are not required to be kebab/snake-case and may
+# contain dots. They still need to be safe to interpolate as a single URL
+# path segment, so they get their own, more permissive check instead of
+# reusing the SKILL.md content naming rule.
+_SAFE_REGISTRY_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
+
+
+def _is_safe_registry_id(name: str) -> bool:
+  """True if `name` is safe to use as a single skill-registry path segment."""
+  return len(name) <= 256 and bool(_SAFE_REGISTRY_ID_PATTERN.fullmatch(name))
+
+
+class _RegistryFrontmatter(models.Frontmatter):
+  """Frontmatter variant that validates names using registry id rules."""
+
+  @field_validator("name")
+  @classmethod
+  def _validate_name(cls, v: str) -> str:
+    if not _is_safe_registry_id(v):
+      raise ValueError(f"not a safe registry id: {v!r}")
+    return v
+
+
+class GCPSkillRegistry(SkillRegistry):
+  """GCP implementation of SkillRegistry using GCP Skill Registry API."""
+
+  def __init__(
+      self,
+      *,
+      project_id: str | None = None,
+      location: str | None = None,
+      credentials: Credentials | None = None,
+  ):
+    """Initializes the GCP Skill Registry.
+
+    Args:
+      project_id: Optional GCP project ID. If omitted, loads from environment.
+      location: Optional GCP location. If omitted, loads from environment.
+      credentials: Optional credentials to use for the client.
+    """
+    self.project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT")
+    self.location = location or os.environ.get("GOOGLE_CLOUD_LOCATION")
+    # Set up SSL context for mTLS if needed
+    self._ssl_context = None
+    use_client_cert = _mtls_utils.use_client_cert_effective()
+    if use_client_cert and mtls.has_default_client_cert_source():
+      try:
+        client_cert_source = mtls.default_client_cert_source()
+        cert_bytes, key_bytes = client_cert_source()
+        fd_cert, cert_path = tempfile.mkstemp()
+        fd_key, key_path = tempfile.mkstemp()
+        try:
+          with os.fdopen(fd_cert, "wb") as f:
+            f.write(cert_bytes)
+          with os.fdopen(fd_key, "wb") as f:
+            f.write(key_bytes)
+          self._ssl_context = ssl.create_default_context()
+          self._ssl_context.load_cert_chain(
+              certfile=cert_path, keyfile=key_path
+          )
+        finally:
+          try:
+            os.remove(cert_path)
+          except OSError:
+            pass
+          try:
+            os.remove(key_path)
+          except OSError:
+            pass
+      except Exception:  # pylint: disable=broad-exception-caught
+        # Fallback to default ssl configuration if cert source is broken
+        pass
+
+    self.base_url = os.environ.get(
+        "AGENT_REGISTRY_ENDPOINT",
+        _mtls_utils.get_api_endpoint(
+            location="",
+            default_template="https://agentregistry.googleapis.com/v1alpha",
+            mtls_template="https://agentregistry.mtls.googleapis.com/v1alpha",
+        ),
+    )
+
+    if not self.project_id or not self.location:
+      raise ValueError(
+          "project_id and location must be specified or set via environment"
+          " variables."
+      )
+    self._credentials: Credentials | None = credentials
+
+  async def _get_headers(self) -> dict[str, str]:
+    """Refreshes credentials and returns authorization headers."""
+    if self._credentials is None:
+      try:
+        self._credentials, _ = google.auth.default()
+      except google.auth.exceptions.DefaultCredentialsError as e:
+        raise RuntimeError(
+            f"Failed to get default Google Cloud credentials: {e}"
+        ) from e
+
+    if not self._credentials.valid:
+      # google.auth.credentials.Credentials.refresh is a blocking call,
+      # so run it in a separate thread.
+      request = auth_requests.Request()
+      await asyncio.to_thread(self._credentials.refresh, request)
+
+    quota_project_id = (
+        getattr(self._credentials, "quota_project_id", None) or self.project_id
+    )
+    headers = {
+        "Authorization": f"Bearer {self._credentials.token}",
+        "Content-Type": "application/json",
+    }
+    if quota_project_id:
+      headers["x-goog-user-project"] = quota_project_id
+    return merge_tracking_headers(headers)
+
+  async def _make_request(
+      self,
+      client: httpx.AsyncClient,
+      url: str,
+      params: dict[str, Any] | None = None,
+      *,
+      method: str = "GET",
+      json: dict[str, Any] | None = None,
+  ) -> httpx.Response:
+    """Helper function to make HTTP requests to the Agent Registry API."""
+    method_upper = method.upper()
+    if method_upper == "GET" and json is not None:
+      raise ValueError("GET requests do not support a JSON body.")
+    headers = await self._get_headers()
+    try:
+      if method_upper == "POST":
+        response = await client.post(
+            url, headers=headers, params=params, json=json
+        )
+      elif method_upper == "GET":
+        response = await client.get(url, headers=headers, params=params)
+      else:
+        response = await client.request(
+            method_upper, url, headers=headers, params=params, json=json
+        )
+      response.raise_for_status()
+      return response
+    except httpx.HTTPStatusError as e:
+      raise RuntimeError(
+          f"API request failed with status {e.response.status_code}:"
+          f" {e.response.text}"
+      ) from e
+    except httpx.RequestError as e:
+      raise RuntimeError(f"API request failed (network error): {e}") from e
+    except Exception as e:
+      raise RuntimeError(f"API request failed: {e}") from e
+
+  def _create_httpx_client(self) -> httpx.AsyncClient:
+    """Creates a new httpx.AsyncClient with appropriate SSL/mTLS configuration."""
+    base_host = httpx.URL(self.base_url).host
+
+    async def _drop_cross_origin_goog_headers(request: httpx.Request) -> None:
+      if request.url.host != base_host:
+        for header in list(request.headers):
+          if header.lower().startswith("x-goog-"):
+            del request.headers[header]
+
+    # The Agent Registry media download (alt=media) replies with a 302 to a
+    # short-lived GCS signed URL, so the client must follow redirects; httpx
+    # drops the Authorization header on cross-origin redirects, but retains
+    # custom headers like x-goog-user-project and x-goog-api-client. GCS
+    # requires all x-goog-* headers on a signed request to match its signature,
+    # so we drop them when redirected off the base API host.
+    event_hooks = {"request": [_drop_cross_origin_goog_headers]}
+    if self._ssl_context is not None:
+      return httpx.AsyncClient(
+          verify=self._ssl_context,
+          follow_redirects=True,
+          event_hooks=event_hooks,
+      )
+    return httpx.AsyncClient(
+        follow_redirects=True,
+        event_hooks=event_hooks,
+    )
+
+  async def get_skill(self, *, name: str) -> models.Skill:
+    """Fetches a skill from the registry.
+
+    Args:
+      name: The name of the skill.
+
+    Returns:
+      A Skill object.
+
+    Raises:
+      ValueError: If the name is not a valid skill name.
+    """
+    # The name reaches here straight from a model-issued tool call, so it must
+    # be a single, safe path segment before it is interpolated into the
+    # request URL. This is a registry resource id, not a SKILL.md frontmatter
+    # name, so it is held to its own safe-path-segment rule rather than the
+    # stricter kebab/snake-case naming rule SKILL.md content is held to.
+    if not _is_safe_registry_id(name):
+      raise ValueError(
+          f"Invalid skill name {name!r}: name must be a single safe path"
+          " segment of at most 256 characters (lowercase letters, digits,"
+          " and non-consecutive '.', '_', '-' separators), with no leading,"
+          " trailing, or consecutive delimiters."
+      )
+
+    async with self._create_httpx_client() as client:
+      # 1. Fetch the logical Skill metadata
+      skill_url = (
+          f"{self.base_url}/projects/{self.project_id}/"
+          f"locations/{self.location}/skills/{quote(name, safe='')}"
+      )
+      response = await self._make_request(client, skill_url)
+      skill_data = response.json()
+
+      default_revision = skill_data.get("defaultRevision") or skill_data.get(
+          "default_revision"
+      )
+      if not default_revision:
+        raise ValueError(f"Skill '{name}' does not contain default revision.")
+
+      # 2. Fetch the zipped filesystem via direct media download of default
+      # revision
+      revision_url = f"{self.base_url}/{default_revision}"
+      media_response = await self._make_request(
+          client, revision_url, params={"alt": "media"}
+      )
+      zip_bytes = media_response.content
+
+    # pylint: disable=protected-access
+    skill = await asyncio.to_thread(
+        _utils._load_skill_from_zip_bytes, zip_bytes
+    )
+    skill._uri = revision_url
+    return skill
+
+  async def search_skills(self, *, query: str) -> list[models.Frontmatter]:
+    """Searches for skills in the registry.
+
+    Args:
+      query: The search query.
+
+    Returns:
+      A list of Frontmatter objects for discovery. A catalog entry that fails
+      client-side frontmatter validation is skipped and logged, not raised: the
+      caller does not control what the catalog holds, so one entry it never
+      asked about must not break discovery for everything else.
+    """
+    async with self._create_httpx_client() as client:
+      url = (
+          f"{self.base_url}/projects/{self.project_id}/"
+          f"locations/{self.location}/skills:search"
+      )
+      payload = {
+          "search_string": query,
+      }
+      try:
+        response = await self._make_request(
+            client, url, method="POST", json=payload
+        )
+      except RuntimeError as e:
+        # TODO(b/569994748): Remove GET fallback once Agent Registry POST rollout is complete in prod.
+        if isinstance(
+            e.__cause__, httpx.HTTPStatusError
+        ) and e.__cause__.response.status_code in (404, 405):
+          logger.info(
+              "POST %s returned %d; falling back to GET for SearchSkills.",
+              url,
+              e.__cause__.response.status_code,
+          )
+          response = await self._make_request(
+              client, url, method="GET", params={"search_string": query}
+          )
+        else:
+          raise
+      response_data = response.json()
+
+      results: list[models.Frontmatter] = []
+      for s in response_data.get("skills", []):
+        # A non-string name is as much outside the caller's control as a
+        # non-conforming one, so give it the same treatment: an empty name
+        # fails validation below and takes the skip path.
+        raw_name = s.get("name")
+        name = raw_name.split("/")[-1] if isinstance(raw_name, str) else ""
+        try:
+          results.append(
+              _RegistryFrontmatter(
+                  name=name,
+                  description=s.get("description", "") or "",
+              )
+          )
+        except ValidationError as e:
+          logger.warning(
+              "Skipping search result %r: it does not pass frontmatter"
+              " validation: %s",
+              name,
+              e,
+          )
+      return results

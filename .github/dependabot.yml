@@ -9,3 +9,11 @@ updates:
     directory: /installer
     schedule:
       interval: weekly
+  - package-ecosystem: uv
+    directories:
+      - /tests/agno
+      - /tests/crewai
+      - /tests/langgraph
+      - /tests/google_adk
+    schedule:
+      interval: weekly

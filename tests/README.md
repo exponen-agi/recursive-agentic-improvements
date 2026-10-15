@@ -13,10 +13,10 @@ Developers and collaborators can use these examples to:
 
 | Framework | Verified Version | Showcase Path | Run Command |
 |---|---|---|---|
-| **Agno** | 2.9.0 | `tests/agno/` | `python -m tests.agno.agent_test` |
+| **Agno** | 3.1.3 | `tests/agno/` | `python -m tests.agno.agent_test` |
 | **CrewAI** | 1.15.17 | `tests/crewai/` | `python -m tests.crewai.main` |
-| **LangGraph** | 1.2.11 | `tests/langgraph/` | `python -m tests.langgraph.run` |
-| **Google ADK** | 2.9.1 | `tests/google_adk/` | `python -m tests.google_adk.run` |
+| **LangGraph** | 1.2.15 | `tests/langgraph/` | `python -m tests.langgraph.run` |
+| **Google ADK** | 2.12.0 | `tests/google_adk/` | `python -m tests.google_adk.run` |
 
 ---
 

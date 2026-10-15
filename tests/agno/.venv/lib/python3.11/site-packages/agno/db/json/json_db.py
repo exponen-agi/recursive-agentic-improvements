@@ -1,0 +1,2181 @@
+import errno
+import json
+import os
+import stat
+import time
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
+from uuid import uuid4
+
+if TYPE_CHECKING:
+    from agno.tracing.schemas import Span, Trace
+
+from agno.db.base import BaseDb, SessionType
+from agno.db.json.utils import (
+    apply_sorting,
+    calculate_date_metrics,
+    fetch_all_sessions_data,
+    get_dates_to_calculate_metrics_for,
+)
+from agno.db.schemas.evals import EvalFilterType, EvalRunRecord, EvalType
+from agno.db.schemas.knowledge import KnowledgeRow
+from agno.db.schemas.memory import UserMemory
+from agno.db.utils import (
+    build_single_run_row,
+    deserialize_run,
+    deserialize_session,
+    deserialize_sessions,
+    drop_legacy_metrics,
+    filter_context_runs,
+    merge_runs_table_with_legacy_blob,
+    metrics_starting_date_from_records,
+)
+from agno.run.agent import RunOutput
+from agno.run.base import RunStatus
+from agno.run.team import TeamRunOutput
+from agno.run.workflow import WorkflowRunOutput
+from agno.session import AgentSession, Session, TeamSession, WorkflowSession
+from agno.utils.log import log_debug, log_error, log_info, log_warning
+from agno.utils.string import generate_id
+
+# Errors where an existing table can't be replaced atomically, so it is written in place instead
+_IN_PLACE_WRITE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EBUSY, errno.EXDEV})
+
+
+class JsonDb(BaseDb):
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        session_table: Optional[str] = None,
+        runs_table: Optional[str] = None,
+        memory_table: Optional[str] = None,
+        metrics_table: Optional[str] = None,
+        eval_table: Optional[str] = None,
+        knowledge_table: Optional[str] = None,
+        traces_table: Optional[str] = None,
+        spans_table: Optional[str] = None,
+        id: Optional[str] = None,
+    ):
+        """
+        Interface for interacting with JSON files as database.
+
+        Args:
+            db_path (Optional[str]): Path to the directory where JSON files will be stored.
+            session_table (Optional[str]): Name of the JSON file to store sessions (without .json extension).
+            runs_table (Optional[str]): Name of the JSON file to store runs (one entry per run).
+            memory_table (Optional[str]): Name of the JSON file to store memories.
+            metrics_table (Optional[str]): Name of the JSON file to store metrics.
+            eval_table (Optional[str]): Name of the JSON file to store evaluation runs.
+            knowledge_table (Optional[str]): Name of the JSON file to store knowledge content.
+            traces_table (Optional[str]): Name of the JSON file to store run traces.
+            spans_table (Optional[str]): Name of the JSON file to store span events.
+            id (Optional[str]): ID of the database.
+        """
+        if id is None:
+            seed = db_path or "agno_json_db"
+            id = generate_id(seed)
+
+        super().__init__(
+            id=id,
+            session_table=session_table,
+            runs_table=runs_table,
+            memory_table=memory_table,
+            metrics_table=metrics_table,
+            eval_table=eval_table,
+            knowledge_table=knowledge_table,
+            traces_table=traces_table,
+            spans_table=spans_table,
+        )
+
+        # Create the directory where the JSON files will be stored, if it doesn't exist
+        self.db_path = Path(db_path or os.path.join(os.getcwd(), "agno_json_db"))
+
+    def table_exists(self, table_name: str) -> bool:
+        """JSON implementation, always returns True."""
+        return True
+
+    def _read_json_file(self, filename: str, create_table_if_not_found: Optional[bool] = True) -> List[Dict[str, Any]]:
+        """Read data from a JSON file, creating it if it doesn't exist.
+
+        Args:
+            filename (str): The name of the JSON file to read.
+
+        Returns:
+            List[Dict[str, Any]]: The data from the JSON file.
+
+        Raises:
+            json.JSONDecodeError: If the JSON file is not valid.
+        """
+        file_path = self.db_path / f"{filename}.json"
+
+        # Create directory if it doesn't exist
+        self.db_path.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+        except FileNotFoundError:
+            if create_table_if_not_found:
+                # Exclusive create so a table published by a concurrent writer is never truncated
+                try:
+                    with open(file_path, "x", encoding="utf-8") as f:
+                        json.dump([], f)
+                except FileExistsError:
+                    pass
+            return []
+
+        except json.JSONDecodeError as e:
+            log_error(f"Error reading the {file_path} JSON file: {str(e)}")
+            raise e
+
+    def _write_json_file(self, filename: str, data: List[Dict[str, Any]]) -> None:
+        """Write data to a JSON file, publishing regular tables after serialization succeeds.
+
+        Args:
+            filename (str): The name of the JSON file to write.
+            data (List[Dict[str, Any]]): The data to write to the JSON file.
+
+        Raises:
+            Exception: If an error occurs while writing to the JSON file.
+        """
+        file_path = (self.db_path / f"{filename}.json").resolve()
+
+        # Create directory if it doesn't exist
+        self.db_path.mkdir(parents=True, exist_ok=True)
+
+        temporary_path: Optional[Path] = None
+        try:
+            existing = file_path.stat() if file_path.exists() else None
+            if existing is not None and not stat.S_ISREG(existing.st_mode):
+                self._write_json_in_place(file_path, data)
+                return
+            if existing is not None:
+                descriptor = os.open(file_path, os.O_WRONLY)
+                os.close(descriptor)
+
+            serializing = False
+            try:
+                staging_path = file_path.with_name(f".agno-json-{uuid4().hex}.tmp")
+                with open(staging_path, "x", encoding="utf-8") as f:
+                    temporary_path = staging_path
+                    if existing is not None:
+                        self._copy_table_metadata(staging_path, existing)
+                    serializing = True
+                    json.dump(data, f, indent=2, default=str)
+                serializing = False
+                os.replace(staging_path, file_path)
+            except OSError as e:
+                # Bind-mounted tables, read-only directories and foreign-owned tables can't be replaced.
+                # Serialization errors always propagate so the existing table is never truncated.
+                if serializing or existing is None or e.errno not in _IN_PLACE_WRITE_ERRNOS:
+                    raise
+                log_debug(f"Writing {file_path} in place: {e}")
+                self._write_json_in_place(file_path, data)
+
+        except Exception as e:
+            log_error(f"Error writing to the {file_path} JSON file: {str(e)}")
+            raise e
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _copy_table_metadata(staging_path: Path, existing: os.stat_result) -> None:
+        """Give the staging file the existing table's owner and mode bits."""
+        staged = staging_path.stat()
+        if hasattr(os, "chown") and (staged.st_uid, staged.st_gid) != (existing.st_uid, existing.st_gid):
+            os.chown(staging_path, existing.st_uid, existing.st_gid)
+        os.chmod(staging_path, stat.S_IMODE(existing.st_mode))
+
+    @staticmethod
+    def _write_json_in_place(file_path: Path, data: List[Dict[str, Any]]) -> None:
+        """Overwrite the table directly, for paths that can't be replaced atomically."""
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+
+    def get_latest_schema_version(self, table_name: str = "") -> Optional[str]:
+        """Get the schema version stamped for the given table.
+
+        Defaults to "2.0.0" when nothing is stamped so the MigrationManager
+        runs migrations instead of skipping the table.
+        """
+        rows = self._read_json_file(self.versions_table_name, create_table_if_not_found=True)
+        for row in rows:
+            if row.get("table_name") == table_name:
+                return row.get("version") or "2.0.0"
+        return "2.0.0"
+
+    def upsert_schema_version(self, table_name: str = "", version: str = "") -> None:
+        """Record the schema version stamp for the given table."""
+        rows = self._read_json_file(self.versions_table_name, create_table_if_not_found=True)
+        entry = {"table_name": table_name, "version": version, "updated_at": int(time.time())}
+        rows = [row for row in rows if row.get("table_name") != table_name]
+        rows.append(entry)
+        self._write_json_file(self.versions_table_name, rows)
+
+    # -- Run methods --
+
+    def _read_runs_file(self, create_table_if_not_found: Optional[bool] = True) -> List[Dict[str, Any]]:
+        """Read the runs file. Returns [] if empty / not yet created."""
+        return self._read_json_file(self.runs_table_name, create_table_if_not_found=create_table_if_not_found)
+
+    def _write_runs_file(self, rows: List[Dict[str, Any]]) -> None:
+        """Replace the runs file with the given list of rows."""
+        self._write_json_file(self.runs_table_name, rows)
+
+    def _get_session_runs_data(self, session_id: str) -> List[Dict[str, Any]]:
+        """Get raw run_data dicts for the given session, in insertion order."""
+        all_runs = self._read_runs_file(create_table_if_not_found=False)
+        rows = [r for r in all_runs if r.get("session_id") == session_id]
+        rows.sort(key=lambda r: (r.get("run_index") or 0, r.get("created_at") or 0))
+        return [r["run_data"] for r in rows if "run_data" in r]
+
+    def _get_sessions_runs_data(self, session_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Get raw run_data dicts for several sessions, grouped by session_id."""
+        if not session_ids:
+            return {}
+        all_runs = self._read_runs_file(create_table_if_not_found=False)
+        wanted = set(session_ids)
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for r in all_runs:
+            sid = r.get("session_id")
+            if sid in wanted and "run_data" in r:
+                grouped.setdefault(sid, []).append(r)
+        for sid, items in grouped.items():
+            items.sort(key=lambda r: (r.get("run_index") or 0, r.get("created_at") or 0))
+            grouped[sid] = [it["run_data"] for it in items]
+        return grouped  # type: ignore[return-value]
+
+    def upsert_run(
+        self,
+        run: Union[RunOutput, TeamRunOutput, WorkflowRunOutput, Dict[str, Any]],
+        session_id: str,
+        user_id: Optional[str] = None,
+        run_index: Optional[int] = None,
+    ) -> None:
+        """Upsert a single run row in the runs file.
+
+        Optimized for updating existing runs (e.g., status changes in HITL or
+        background mode) without re-upserting all runs in the session.
+
+        For new runs, ``run_index`` should be provided or will be read from
+        ``run_data``. For updates to existing runs, ``run_index`` is preserved
+        from the original insert.
+
+        Args:
+            run: The run object or dictionary to upsert.
+            session_id: The session ID this run belongs to.
+            user_id: Optional user ID to associate with the run.
+            run_index: Optional run index for new runs.
+
+        Raises:
+            ValueError: If the run has no run_id.
+            Exception: If an error occurs during upsert.
+        """
+        try:
+            row = build_single_run_row(
+                run=run,
+                session_id=session_id,
+                user_id=user_id,
+                run_index=run_index,
+            )
+
+            existing = self._read_runs_file(create_table_if_not_found=True)
+            replaced = False
+            for i, r in enumerate(existing):
+                if r.get("run_id") == row["run_id"]:
+                    # Preserve the original run_index (don't bump it on update)
+                    row["run_index"] = r.get("run_index", row.get("run_index"))
+                    existing[i] = row
+                    replaced = True
+                    break
+            if not replaced:
+                existing.append(row)
+            self._write_runs_file(existing)
+        except Exception as e:
+            log_error(f"Exception upserting run into runs file: {str(e)}")
+            raise e
+
+    def _delete_session_runs(self, session_id: str) -> int:
+        """Cascade-delete every run row for a session."""
+        existing = self._read_runs_file(create_table_if_not_found=False)
+        kept = [r for r in existing if r.get("session_id") != session_id]
+        deleted = len(existing) - len(kept)
+        if deleted:
+            self._write_runs_file(kept)
+        return deleted
+
+    def cleanup_legacy_runs_field(self, force: bool = False) -> bool:
+        """Unset the legacy ``runs`` field from session records.
+
+        The v3.0.0 migration intentionally leaves the legacy ``runs`` field on
+        session records as a backup. Once you have verified the migration and
+        taken a backup, call this to reclaim the storage.
+
+        Args:
+            force: If True, unset the field even on sessions that still hold a
+                non-null ``runs`` array. Defaults to False.
+
+        Returns:
+            True if any session records were touched, False otherwise.
+        """
+        sessions = self._read_json_file(self.session_table_name, create_table_if_not_found=False)
+        if not sessions:
+            return False
+
+        if not force:
+            pending = sum(1 for s in sessions if s.get("runs"))
+            if pending > 0:
+                raise RuntimeError(
+                    f"Refusing to unset {self.session_table_name}.runs: {pending} session(s) still have "
+                    "non-null `runs` content. Run MigrationManager(db).up() first, or pass force=True."
+                )
+
+        touched = 0
+        for s in sessions:
+            if "runs" in s:
+                s.pop("runs", None)
+                touched += 1
+        if touched:
+            self._write_json_file(self.session_table_name, sessions)
+        log_info(f"Unset runs on {touched} session record(s)")
+        return touched > 0
+
+    def get_run(
+        self, run_id: str, deserialize: Optional[bool] = True
+    ) -> Optional[Union[RunOutput, TeamRunOutput, WorkflowRunOutput, Dict[str, Any]]]:
+        try:
+            for r in self._read_runs_file(create_table_if_not_found=False):
+                if r.get("run_id") == run_id:
+                    if not deserialize:
+                        return r
+                    return deserialize_run(r.get("run_type"), r["run_data"])
+            return None
+        except Exception as e:
+            log_error(f"Exception reading run: {str(e)}")
+            raise e
+
+    def get_runs(
+        self,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        status: Optional[RunStatus] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+    ) -> Union[List[Union[RunOutput, TeamRunOutput, WorkflowRunOutput]], Tuple[List[Dict[str, Any]], int]]:
+        from agno.db.utils import validate_pagination
+
+        validate_pagination(limit, page)
+        try:
+            rows = self._read_runs_file(create_table_if_not_found=False)
+            if session_id is not None:
+                rows = [r for r in rows if r.get("session_id") == session_id]
+            if user_id is not None:
+                rows = [r for r in rows if r.get("user_id") == user_id]
+            if agent_id is not None:
+                rows = [r for r in rows if r.get("agent_id") == agent_id]
+            if team_id is not None:
+                rows = [r for r in rows if r.get("team_id") == team_id]
+            if workflow_id is not None:
+                rows = [r for r in rows if r.get("workflow_id") == workflow_id]
+            if status is not None:
+                status_value = status.value if isinstance(status, RunStatus) else status
+                rows = [r for r in rows if r.get("status") == status_value]
+
+            total_count = len(rows)
+
+            if sort_by is not None:
+                rows = apply_sorting(rows, sort_by, sort_order)
+            else:
+                rows = sorted(rows, key=lambda r: (r.get("run_index") or 0, r.get("created_at") or 0))
+
+            if limit is not None:
+                start = 0
+                if page is not None:
+                    start = (page - 1) * limit
+                rows = rows[start : start + limit]
+
+            if not deserialize:
+                return rows, total_count
+            return [deserialize_run(r.get("run_type"), r["run_data"]) for r in rows]
+        except Exception as e:
+            log_error(f"Exception reading runs: {str(e)}")
+            raise e
+
+    def _scrub_run_ids_from_legacy_blob(self, run_ids: set) -> None:
+        """Remove ``run_ids`` from every session's legacy ``runs`` field.
+
+        During partial-migration state (v3 in progress, ``cleanup_legacy_runs_field``
+        not yet run), each session document still carries the pre-migration
+        ``runs`` blob as a backup. Deleting from the runs table alone leaves
+        the blob intact, and the read path's ``merge_runs_table_with_legacy_blob``
+        resurrects the ghost. This scrub keeps the two surfaces in sync.
+        """
+        if not run_ids:
+            return
+        try:
+            sessions = self._read_json_file(self.session_table_name, create_table_if_not_found=False)
+        except Exception:
+            return
+        mutated = False
+        for s in sessions:
+            legacy = s.get("runs")
+            if not isinstance(legacy, list):
+                continue
+            kept = [r for r in legacy if not (isinstance(r, dict) and r.get("run_id") in run_ids)]
+            if len(kept) != len(legacy):
+                s["runs"] = kept
+                mutated = True
+        if mutated:
+            self._write_json_file(self.session_table_name, sessions)
+
+    def delete_run(self, run_id: str) -> bool:
+        try:
+            rows = self._read_runs_file(create_table_if_not_found=False)
+            kept = [r for r in rows if r.get("run_id") != run_id]
+            deleted = len(kept) != len(rows)
+            if deleted:
+                self._write_runs_file(kept)
+            # Also scrub the legacy blob so the merge helper doesn't resurrect
+            # the run on the next read (partial-migration state).
+            self._scrub_run_ids_from_legacy_blob({run_id})
+            return deleted
+        except Exception as e:
+            log_error(f"Error deleting run: {str(e)}")
+            raise e
+
+    def delete_runs(self, run_ids: List[str]) -> None:
+        try:
+            rows = self._read_runs_file(create_table_if_not_found=False)
+            to_drop = set(run_ids)
+            kept = [r for r in rows if r.get("run_id") not in to_drop]
+            if len(kept) != len(rows):
+                self._write_runs_file(kept)
+            self._scrub_run_ids_from_legacy_blob(to_drop)
+        except Exception as e:
+            log_error(f"Error deleting runs: {str(e)}")
+            raise e
+
+    # -- Session methods --
+
+    def delete_session(self, session_id: str, user_id: Optional[str] = None) -> bool:
+        """Delete a session from the JSON file.
+
+        Args:
+            session_id (str): The ID of the session to delete.
+            user_id (Optional[str]): User ID to filter by. Defaults to None.
+
+        Returns:
+            bool: True if the session was deleted, False otherwise.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            sessions = self._read_json_file(self.session_table_name)
+            original_count = len(sessions)
+            sessions = [
+                s
+                for s in sessions
+                if not (s.get("session_id") == session_id and (user_id is None or s.get("user_id") == user_id))
+            ]
+
+            if len(sessions) < original_count:
+                self._write_json_file(self.session_table_name, sessions)
+                # Cascade-delete runs
+                self._delete_session_runs(session_id)
+                log_debug(f"Successfully deleted session with session_id: {session_id}")
+                return True
+
+            else:
+                log_debug(f"No session found to delete with session_id: {session_id}")
+                return False
+
+        except Exception as e:
+            log_error(f"Error deleting session: {str(e)}")
+            raise e
+
+    def delete_sessions(self, session_ids: List[str], user_id: Optional[str] = None) -> None:
+        """Delete multiple sessions from the JSON file.
+
+        Args:
+            session_ids (List[str]): The IDs of the sessions to delete.
+            user_id (Optional[str]): User ID to filter by. Defaults to None.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            sessions = self._read_json_file(self.session_table_name)
+            # Capture which session_ids actually get deleted (post user_id filter)
+            deleted_ids = {
+                s.get("session_id")
+                for s in sessions
+                if s.get("session_id") in session_ids and (user_id is None or s.get("user_id") == user_id)
+            }
+            sessions = [
+                s
+                for s in sessions
+                if not (s.get("session_id") in session_ids and (user_id is None or s.get("user_id") == user_id))
+            ]
+            self._write_json_file(self.session_table_name, sessions)
+            # Cascade-delete runs for each deleted session
+            if deleted_ids:
+                all_runs = self._read_runs_file(create_table_if_not_found=False)
+                kept_runs = [r for r in all_runs if r.get("session_id") not in deleted_ids]
+                if len(kept_runs) != len(all_runs):
+                    self._write_runs_file(kept_runs)
+            log_debug(f"Successfully deleted sessions with ids: {session_ids}")
+
+        except Exception as e:
+            log_error(f"Error deleting sessions: {str(e)}")
+            raise e
+
+    def get_session(
+        self,
+        session_id: str,
+        session_type: Optional[SessionType] = None,
+        user_id: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+        runs_limit: Optional[int] = None,
+    ) -> Optional[Union[AgentSession, TeamSession, WorkflowSession, Dict[str, Any]]]:
+        """Read a session from the JSON file.
+
+        Args:
+            session_id (str): The ID of the session to read.
+            session_type (Optional[SessionType]): The type of the session to read.
+            user_id (Optional[str]): The ID of the user to read the session for.
+            deserialize (Optional[bool]): Whether to deserialize the session.
+
+        Returns:
+            Union[Session, Dict[str, Any], None]:
+                - When deserialize=True: Session object
+                - When deserialize=False: Session dictionary
+
+        Raises:
+            Exception: If an error occurs while reading the session.
+        """
+        try:
+            sessions = self._read_json_file(self.session_table_name)
+
+            for session_data in sessions:
+                if session_data.get("session_id") == session_id:
+                    if user_id is not None and session_data.get("user_id") != user_id:
+                        continue
+
+                    # Attach runs from the runs file, merged with any legacy `runs` field
+                    runs_data = self._get_session_runs_data(session_id)
+                    session_data["runs"] = merge_runs_table_with_legacy_blob(runs_data, session_data.get("runs"))
+                    if runs_limit is not None:
+                        # No query engine to push "last N" down: filter+slice in memory to
+                        # match the SQL fast path (drop member/skip-status runs, then last N).
+                        session_data["runs"] = filter_context_runs(session_data["runs"] or [])[-runs_limit:]
+
+                    if not deserialize:
+                        return session_data
+
+                    return deserialize_session(session_type, session_data)
+
+            return None
+
+        except Exception as e:
+            log_error(f"Exception reading from session file: {str(e)}")
+            raise e
+
+    def get_sessions(
+        self,
+        session_type: Optional[SessionType] = None,
+        user_id: Optional[str] = None,
+        component_id: Optional[str] = None,
+        session_name: Optional[str] = None,
+        start_timestamp: Optional[int] = None,
+        end_timestamp: Optional[int] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+    ) -> Union[List[Session], Tuple[List[Dict[str, Any]], int]]:
+        """Get all sessions from the JSON file with filtering and pagination.
+
+        Args:
+            session_type (Optional[SessionType]): The type of the sessions to read.
+            user_id (Optional[str]): The ID of the user to read the sessions for.
+            component_id (Optional[str]): The ID of the component to read the sessions for.
+            session_name (Optional[str]): The name of the session to read.
+            start_timestamp (Optional[int]): The start timestamp of the sessions to read.
+            end_timestamp (Optional[int]): The end timestamp of the sessions to read.
+            limit (Optional[int]): The limit of the sessions to read.
+            page (Optional[int]): The page of the sessions to read.
+            sort_by (Optional[str]): The field to sort the sessions by.
+            sort_order (Optional[str]): The order to sort the sessions by.
+            deserialize (Optional[bool]): Whether to deserialize the sessions.
+            create_table_if_not_found (Optional[bool]): Whether to create a json file to track sessions if it doesn't exist.
+
+        Returns:
+            Union[List[AgentSession], List[TeamSession], List[WorkflowSession], Tuple[List[Dict[str, Any]], int]]:
+                - When deserialize=True: List of sessions
+                - When deserialize=False: Tuple with list of sessions and total count
+
+        Raises:
+            Exception: If an error occurs while reading the sessions.
+        """
+        try:
+            sessions_raw = self._read_json_file(self.session_table_name)
+
+            # Apply filters
+            filtered_sessions = []
+            for session_data in sessions_raw:
+                if user_id is not None and session_data.get("user_id") != user_id:
+                    continue
+                if component_id is not None:
+                    if session_type == SessionType.AGENT and session_data.get("agent_id") != component_id:
+                        continue
+                    elif session_type == SessionType.TEAM and session_data.get("team_id") != component_id:
+                        continue
+                    elif session_type == SessionType.WORKFLOW and session_data.get("workflow_id") != component_id:
+                        continue
+                    elif session_type is None:
+                        if (
+                            session_data.get("agent_id") != component_id
+                            and session_data.get("team_id") != component_id
+                            and session_data.get("workflow_id") != component_id
+                        ):
+                            continue
+                if start_timestamp is not None and (session_data.get("created_at") or 0) < start_timestamp:
+                    continue
+                if end_timestamp is not None and (session_data.get("created_at") or 0) > end_timestamp:
+                    continue
+                if session_name is not None:
+                    stored_name = (session_data.get("session_data") or {}).get("session_name", "")
+                    if session_name.lower() not in stored_name.lower():
+                        continue
+                if session_type is not None:
+                    session_type_value = session_type.value if isinstance(session_type, SessionType) else session_type
+                    if session_data.get("session_type") != session_type_value:
+                        continue
+
+                filtered_sessions.append(session_data)
+
+            total_count = len(filtered_sessions)
+
+            # Apply sorting
+            filtered_sessions = apply_sorting(filtered_sessions, sort_by, sort_order)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                filtered_sessions = filtered_sessions[start_idx : start_idx + limit]
+
+            # Attach runs from the runs file, merged with any legacy `runs` field
+            if filtered_sessions:
+                runs_by_session = self._get_sessions_runs_data([s["session_id"] for s in filtered_sessions])
+                for s in filtered_sessions:
+                    runs_data = runs_by_session.get(s["session_id"], [])
+                    s["runs"] = merge_runs_table_with_legacy_blob(runs_data, s.get("runs"))
+
+            if not deserialize:
+                return filtered_sessions, total_count
+
+            return deserialize_sessions(session_type, filtered_sessions)
+
+        except Exception as e:
+            log_error(f"Exception reading from session file: {str(e)}")
+            raise e
+
+    def rename_session(
+        self,
+        session_id: str,
+        session_type: Optional[SessionType],
+        session_name: str,
+        user_id: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+    ) -> Optional[Union[Session, Dict[str, Any]]]:
+        """Rename a session in the JSON file."""
+        try:
+            sessions = self._read_json_file(self.session_table_name)
+
+            for i, session in enumerate(sessions):
+                if session.get("session_id") != session_id:
+                    continue
+                if session_type is not None and session.get("session_type") != session_type.value:
+                    continue
+                if user_id is not None and session.get("user_id") != user_id:
+                    continue
+                # Update session name in session_data
+                if "session_data" not in session or session["session_data"] is None:
+                    session["session_data"] = {}
+                session["session_data"]["session_name"] = session_name
+
+                sessions[i] = session
+                self._write_json_file(self.session_table_name, sessions)
+
+                # Attach runs from the runs file, merged with any legacy `runs` field
+                runs_data = self._get_session_runs_data(session_id)
+                session["runs"] = merge_runs_table_with_legacy_blob(runs_data, session.get("runs"))
+
+                log_debug(f"Renamed session with id '{session_id}' to '{session_name}'")
+
+                if not deserialize:
+                    return session
+
+                return deserialize_session(session_type, session)
+
+            return None
+
+        except Exception as e:
+            log_error(f"Exception renaming session: {str(e)}")
+            raise e
+
+    def upsert_session(
+        self, session: Session, deserialize: Optional[bool] = True
+    ) -> Optional[Union[Session, Dict[str, Any]]]:
+        """Insert or update a session in the JSON file."""
+        try:
+            sessions = self._read_json_file(self.session_table_name, create_table_if_not_found=True)
+            session_dict = session.to_dict(include_runs=False)
+
+            # Add session_type based on session instance type
+            if isinstance(session, AgentSession):
+                session_dict["session_type"] = SessionType.AGENT.value
+            elif isinstance(session, TeamSession):
+                session_dict["session_type"] = SessionType.TEAM.value
+            elif isinstance(session, WorkflowSession):
+                session_dict["session_type"] = SessionType.WORKFLOW.value
+
+            # Find existing session to update
+            session_updated = False
+            for i, existing_session in enumerate(sessions):
+                if existing_session.get("session_id") == session_dict.get("session_id") and self._matches_session_key(
+                    existing_session, session
+                ):
+                    existing_uid = existing_session.get("user_id")
+                    if existing_uid is not None and existing_uid != session_dict.get("user_id"):
+                        return None
+                    # Carry the legacy `runs` blob forward. session.to_dict(include_runs=False)
+                    # omits `runs`, so a bare replace here would silently erase any pre-v3
+                    # history that lives only in the legacy blob (upgrade-without-migration
+                    # data loss). Only cleanup_legacy_runs_field() should drop it, explicitly.
+                    legacy_runs = existing_session.get("runs")
+                    session_dict["updated_at"] = int(time.time())
+                    if legacy_runs is not None:
+                        session_dict["runs"] = legacy_runs
+                    sessions[i] = session_dict
+                    session_updated = True
+                    break
+
+            if not session_updated:
+                # Add new session
+                session_dict["created_at"] = session_dict.get("created_at", int(time.time()))
+                session_dict["updated_at"] = session_dict.get("created_at")
+                sessions.append(session_dict)
+
+            self._write_json_file(self.session_table_name, sessions)
+
+            # Runs are persisted separately via upsert_run by the caller (agent loop).
+            # Attach the in-memory runs to the returned dict so callers see the full picture.
+            session_dict["runs"] = [run if isinstance(run, dict) else run.to_dict() for run in session.runs or []]
+
+            if not deserialize:
+                return session_dict
+
+            return session
+
+        except Exception as e:
+            log_error(f"Exception upserting session: {str(e)}")
+            raise e
+
+    def upsert_sessions(
+        self, sessions: List[Session], deserialize: Optional[bool] = True, preserve_updated_at: bool = False
+    ) -> List[Union[Session, Dict[str, Any]]]:
+        """
+        Bulk upsert multiple sessions for improved performance on large datasets.
+
+        Args:
+            sessions (List[Session]): List of sessions to upsert.
+            deserialize (Optional[bool]): Whether to deserialize the sessions. Defaults to True.
+
+        Returns:
+            List[Union[Session, Dict[str, Any]]]: List of upserted sessions.
+
+        Raises:
+            Exception: If an error occurs during bulk upsert.
+        """
+        if not sessions:
+            return []
+
+        try:
+            log_info(
+                f"JsonDb doesn't support efficient bulk operations, falling back to individual upserts for {len(sessions)} sessions"
+            )
+
+            # Fall back to individual upserts
+            results = []
+            for session in sessions:
+                if session is not None:
+                    result = self.upsert_session(session, deserialize=deserialize)
+                    if result is not None:
+                        results.append(result)
+            return results
+
+        except Exception as e:
+            log_error(f"Exception during bulk session upsert: {str(e)}")
+            return []
+
+    def _matches_session_key(self, existing_session: Dict[str, Any], session: Session) -> bool:
+        """Check if existing session matches the key for the session type."""
+        if isinstance(session, AgentSession):
+            return existing_session.get("agent_id") == session.agent_id
+        elif isinstance(session, TeamSession):
+            return existing_session.get("team_id") == session.team_id
+        elif isinstance(session, WorkflowSession):
+            return existing_session.get("workflow_id") == session.workflow_id
+        return False
+
+    # -- Memory methods --
+    def delete_user_memory(self, memory_id: str, user_id: Optional[str] = None):
+        """Delete a user memory from the JSON file.
+
+        Args:
+            memory_id (str): The ID of the memory to delete.
+            user_id (Optional[str]): The ID of the user (optional, for filtering).
+        """
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+            original_count = len(memories)
+
+            # If user_id is provided, verify the memory belongs to the user before deleting
+            if user_id is not None:
+                memory_to_delete = None
+                for m in memories:
+                    if m.get("memory_id") == memory_id:
+                        memory_to_delete = m
+                        break
+
+                if memory_to_delete and memory_to_delete.get("user_id") != user_id:
+                    log_debug(f"Memory {memory_id} does not belong to user {user_id}")
+                    return
+
+            memories = [m for m in memories if m.get("memory_id") != memory_id]
+
+            if len(memories) < original_count:
+                self._write_json_file(self.memory_table_name, memories)
+                log_debug(f"Successfully deleted user memory id: {memory_id}")
+            else:
+                log_debug(f"No memory found with id: {memory_id}")
+
+        except Exception as e:
+            log_error(f"Error deleting memory: {str(e)}")
+            raise e
+
+    def delete_user_memories(self, memory_ids: List[str], user_id: Optional[str] = None) -> None:
+        """Delete multiple user memories from the JSON file.
+
+        Args:
+            memory_ids (List[str]): List of memory IDs to delete.
+            user_id (Optional[str]): The ID of the user (optional, for filtering).
+        """
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+
+            # If user_id is provided, filter memory_ids to only those belonging to the user
+            if user_id is not None:
+                filtered_memory_ids: List[str] = []
+                for memory in memories:
+                    if memory.get("memory_id") in memory_ids and memory.get("user_id") == user_id:
+                        filtered_memory_ids.append(memory.get("memory_id"))  # type: ignore
+                memory_ids = filtered_memory_ids
+
+            memories = [m for m in memories if m.get("memory_id") not in memory_ids]
+            self._write_json_file(self.memory_table_name, memories)
+
+            log_debug(f"Successfully deleted {len(memory_ids)} user memories")
+
+        except Exception as e:
+            log_error(f"Error deleting memories: {str(e)}")
+            raise e
+
+    def get_all_memory_topics(self, user_id: Optional[str] = None) -> List[str]:
+        """Get all memory topics from the JSON file.
+
+        Args:
+            user_id (Optional[str]): The ID of the user to filter by.
+
+        Returns:
+            List[str]: List of unique memory topics.
+        """
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+
+            topics = set()
+            for memory in memories:
+                if user_id is not None and memory.get("user_id") != user_id:
+                    continue
+                memory_topics = memory.get("topics", [])
+                if isinstance(memory_topics, list):
+                    topics.update(memory_topics)
+            return list(topics)
+
+        except Exception as e:
+            log_error(f"Exception reading from memory file: {str(e)}")
+            raise e
+
+    def get_user_memory(
+        self,
+        memory_id: str,
+        deserialize: Optional[bool] = True,
+        user_id: Optional[str] = None,
+    ) -> Optional[Union[UserMemory, Dict[str, Any]]]:
+        """Get a memory from the JSON file.
+
+        Args:
+            memory_id (str): The ID of the memory to get.
+            deserialize (Optional[bool]): Whether to deserialize the memory.
+            user_id (Optional[str]): The ID of the user (optional, for filtering).
+
+        Returns:
+            Optional[Union[UserMemory, Dict[str, Any]]]: The user memory data if found, None otherwise.
+        """
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+
+            for memory_data in memories:
+                if memory_data.get("memory_id") == memory_id:
+                    # Filter by user_id if provided
+                    if user_id and memory_data.get("user_id") != user_id:
+                        return None
+
+                    if not deserialize:
+                        return memory_data
+                    return UserMemory.from_dict(memory_data)
+
+            return None
+
+        except Exception as e:
+            log_error(f"Exception reading from memory file: {str(e)}")
+            raise e
+
+    def get_user_memories(
+        self,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        topics: Optional[List[str]] = None,
+        search_content: Optional[str] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+    ) -> Union[List[UserMemory], Tuple[List[Dict[str, Any]], int]]:
+        """Get all memories from the JSON file with filtering and pagination."""
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+
+            # Apply filters
+            filtered_memories = []
+            for memory_data in memories:
+                if user_id is not None and memory_data.get("user_id") != user_id:
+                    continue
+                if agent_id is not None and memory_data.get("agent_id") != agent_id:
+                    continue
+                if team_id is not None and memory_data.get("team_id") != team_id:
+                    continue
+                if topics is not None:
+                    memory_topics = memory_data.get("topics", [])
+                    if not any(topic in memory_topics for topic in topics):
+                        continue
+                if search_content is not None:
+                    memory_content = str(memory_data.get("memory", ""))
+                    if search_content.lower() not in memory_content.lower():
+                        continue
+
+                filtered_memories.append(memory_data)
+
+            total_count = len(filtered_memories)
+
+            # Apply sorting
+            filtered_memories = apply_sorting(filtered_memories, sort_by, sort_order)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                filtered_memories = filtered_memories[start_idx : start_idx + limit]
+
+            if not deserialize:
+                return filtered_memories, total_count
+
+            return [UserMemory.from_dict(memory) for memory in filtered_memories]
+
+        except Exception as e:
+            log_error(f"Exception reading from memory file: {str(e)}")
+            raise e
+
+    def get_user_memory_stats(
+        self, limit: Optional[int] = None, page: Optional[int] = None, user_id: Optional[str] = None
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Get user memory statistics.
+
+        Args:
+            limit (Optional[int]): The maximum number of user stats to return.
+            page (Optional[int]): The page number.
+            user_id (Optional[str]): User ID for filtering.
+
+        Returns:
+            Tuple[List[Dict[str, Any]], int]: A list of dictionaries containing user stats and total count.
+        """
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+            user_stats = {}
+
+            for memory in memories:
+                memory_user_id = memory.get("user_id")
+                # filter by user_id if provided
+                if user_id is not None and memory_user_id != user_id:
+                    continue
+                if memory_user_id:
+                    if memory_user_id not in user_stats:
+                        user_stats[memory_user_id] = {
+                            "user_id": memory_user_id,
+                            "total_memories": 0,
+                            "last_memory_updated_at": 0,
+                        }
+                    user_stats[memory_user_id]["total_memories"] += 1
+                    updated_at = memory.get("updated_at", 0)
+                    if updated_at > user_stats[memory_user_id]["last_memory_updated_at"]:
+                        user_stats[memory_user_id]["last_memory_updated_at"] = updated_at
+
+            stats_list = list(user_stats.values())
+            stats_list.sort(key=lambda x: x["last_memory_updated_at"], reverse=True)
+
+            total_count = len(stats_list)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                stats_list = stats_list[start_idx : start_idx + limit]
+
+            return stats_list, total_count
+
+        except Exception as e:
+            log_error(f"Exception getting user memory stats: {str(e)}")
+            raise e
+
+    def upsert_user_memory(
+        self, memory: UserMemory, deserialize: Optional[bool] = True
+    ) -> Optional[Union[UserMemory, Dict[str, Any]]]:
+        """Upsert a user memory in the JSON file."""
+        try:
+            memories = self._read_json_file(self.memory_table_name, create_table_if_not_found=True)
+
+            if memory.memory_id is None:
+                memory.memory_id = str(uuid4())
+
+            memory_dict = memory.to_dict() if hasattr(memory, "to_dict") else memory.__dict__
+            memory_dict["updated_at"] = int(time.time())
+
+            # Find existing memory to update
+            memory_updated = False
+            for i, existing_memory in enumerate(memories):
+                if existing_memory.get("memory_id") == memory.memory_id:
+                    memories[i] = memory_dict
+                    memory_updated = True
+                    break
+
+            if not memory_updated:
+                memories.append(memory_dict)
+
+            self._write_json_file(self.memory_table_name, memories)
+
+            if not deserialize:
+                return memory_dict
+            return UserMemory.from_dict(memory_dict)
+
+        except Exception as e:
+            log_warning(f"Exception upserting user memory: {str(e)}")
+            raise e
+
+    def upsert_memories(
+        self, memories: List[UserMemory], deserialize: Optional[bool] = True, preserve_updated_at: bool = False
+    ) -> List[Union[UserMemory, Dict[str, Any]]]:
+        """
+        Bulk upsert multiple user memories for improved performance on large datasets.
+
+        Args:
+            memories (List[UserMemory]): List of memories to upsert.
+            deserialize (Optional[bool]): Whether to deserialize the memories. Defaults to True.
+
+        Returns:
+            List[Union[UserMemory, Dict[str, Any]]]: List of upserted memories.
+
+        Raises:
+            Exception: If an error occurs during bulk upsert.
+        """
+        if not memories:
+            return []
+
+        try:
+            log_info(
+                f"JsonDb doesn't support efficient bulk operations, falling back to individual upserts for {len(memories)} memories"
+            )
+            # Fall back to individual upserts
+            results = []
+            for memory in memories:
+                if memory is not None:
+                    result = self.upsert_user_memory(memory, deserialize=deserialize)
+                    if result is not None:
+                        results.append(result)
+            return results
+
+        except Exception as e:
+            log_error(f"Exception during bulk memory upsert: {str(e)}")
+            return []
+
+    def clear_memories(self) -> None:
+        """Delete all memories from the database.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            # Simply write an empty list to the memory JSON file
+            self._write_json_file(self.memory_table_name, [])
+
+        except Exception as e:
+            log_warning(f"Exception deleting all memories: {str(e)}")
+            raise e
+
+    # -- Metrics methods --
+    def calculate_metrics(self) -> Optional[list[dict]]:
+        """Calculate metrics for all dates without complete metrics."""
+        try:
+            metrics = self._read_json_file(self.metrics_table_name, create_table_if_not_found=True)
+
+            starting_date = self._get_metrics_calculation_starting_date(metrics)
+            if starting_date is None:
+                log_info("No session data found. Won't calculate metrics.")
+                return None
+
+            dates_to_process = get_dates_to_calculate_metrics_for(starting_date)
+            if not dates_to_process:
+                log_info("Metrics already calculated for all relevant dates.")
+                return None
+
+            start_timestamp = int(
+                datetime.combine(dates_to_process[0], datetime.min.time()).replace(tzinfo=timezone.utc).timestamp()
+            )
+            end_timestamp = int(
+                datetime.combine(dates_to_process[-1] + timedelta(days=1), datetime.min.time())
+                .replace(tzinfo=timezone.utc)
+                .timestamp()
+            )
+
+            sessions = self._get_all_sessions_for_metrics_calculation(start_timestamp, end_timestamp)
+            all_sessions_data = fetch_all_sessions_data(
+                sessions=sessions, dates_to_process=dates_to_process, start_timestamp=start_timestamp
+            )
+            if not all_sessions_data:
+                log_info("No new session data found. Won't calculate metrics.")
+                return None
+
+            results = []
+
+            for date_to_process in dates_to_process:
+                date_key = date_to_process.isoformat()
+                sessions_for_date = all_sessions_data.get(date_key, {})
+
+                # Skip dates with no sessions
+                if not any(len(sessions) > 0 for sessions in sessions_for_date.values()):
+                    continue
+
+                # Upsert one metrics record per user_id
+                for metrics_record in calculate_date_metrics(date_to_process, sessions_for_date):
+                    existing_record_idx = None
+                    for i, existing_metric in enumerate(metrics):
+                        if (
+                            existing_metric.get("user_id") == metrics_record["user_id"]
+                            and existing_metric.get("date") == str(date_to_process)
+                            and existing_metric.get("aggregation_period") == "daily"
+                        ):
+                            existing_record_idx = i
+                            break
+
+                    if existing_record_idx is not None:
+                        metrics[existing_record_idx] = metrics_record
+                    else:
+                        metrics.append(metrics_record)
+
+                    results.append(metrics_record)
+
+            if results:
+                self._write_json_file(self.metrics_table_name, metrics)
+
+            log_debug("Updated metrics calculations")
+
+            return results
+
+        except Exception as e:
+            log_warning(f"Exception refreshing metrics: {str(e)}")
+            raise e
+
+    def _get_metrics_calculation_starting_date(self, metrics: List[Dict[str, Any]]) -> Optional[date]:
+        """Get the first date for which metrics calculation is needed."""
+        resume_date = metrics_starting_date_from_records(metrics)
+        if resume_date is not None:
+            return resume_date
+
+        # No metrics records. Return the date of the first recorded session.
+        # We need to get sessions of all types, so we'll read directly from the file
+        all_sessions = self._read_json_file(self.session_table_name)
+        if all_sessions:
+            # Sort by created_at
+            all_sessions.sort(key=lambda x: x.get("created_at", 0))
+            first_session_date = all_sessions[0]["created_at"]
+            return datetime.fromtimestamp(first_session_date, tz=timezone.utc).date()
+
+        return None
+
+    def _get_all_sessions_for_metrics_calculation(
+        self, start_timestamp: Optional[int] = None, end_timestamp: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Get all sessions for metrics calculation."""
+        try:
+            sessions = self._read_json_file(self.session_table_name)
+
+            filtered_sessions = []
+            for session in sessions:
+                created_at = session.get("created_at", 0)
+                if start_timestamp is not None and created_at < start_timestamp:
+                    continue
+                if end_timestamp is not None and created_at >= end_timestamp:
+                    continue
+
+                filtered_session = {
+                    "session_id": session.get("session_id"),
+                    "user_id": session.get("user_id"),
+                    "session_data": session.get("session_data"),
+                    "runs": session.get("runs"),  # legacy fallback for un-migrated sessions
+                    "created_at": session.get("created_at"),
+                    "session_type": session.get("session_type"),
+                }
+                filtered_sessions.append(filtered_session)
+
+            # Attach lightweight run info (model + provider) from the runs file.
+            if filtered_sessions:
+                session_ids: List[str] = [str(s["session_id"]) for s in filtered_sessions if s.get("session_id")]
+                runs_by_session = self._get_sessions_runs_data(session_ids)
+                for s in filtered_sessions:
+                    sid = s.get("session_id")
+                    if sid is None:
+                        continue
+                    rb = [
+                        {"model": rd.get("model"), "model_provider": rd.get("model_provider")}
+                        for rd in runs_by_session.get(sid, [])
+                    ]
+                    if rb or not s.get("runs"):
+                        s["runs"] = rb
+
+            return filtered_sessions
+
+        except Exception as e:
+            log_error(f"Exception reading sessions for metrics: {str(e)}")
+            raise e
+
+    def get_metrics(
+        self,
+        starting_date: Optional[date] = None,
+        ending_date: Optional[date] = None,
+        user_id: Optional[str] = None,
+    ) -> Tuple[List[dict], Optional[int]]:
+        """Get all metrics matching the given date range.
+
+        Args:
+            starting_date (Optional[date]): The starting date to filter metrics by.
+            ending_date (Optional[date]): The ending date to filter metrics by.
+            user_id (Optional[str]): The ID of the user to filter by. ``None`` returns metrics for all users.
+        """
+        try:
+            metrics = self._read_json_file(self.metrics_table_name)
+            # Records written before ownership existed hold a whole day, and only an
+            # unscoped read sees them: an owner filter excludes them already
+            if user_id is None:
+                metrics = drop_legacy_metrics(metrics)
+
+            filtered_metrics = []
+            latest_updated_at = None
+
+            for metric in metrics:
+                metric_date = datetime.strptime(metric.get("date", ""), "%Y-%m-%d").date()
+
+                if starting_date and metric_date < starting_date:
+                    continue
+                if ending_date and metric_date > ending_date:
+                    continue
+                if user_id is not None and metric.get("user_id") != user_id:
+                    continue
+
+                row = dict(metric)
+                # Map the sentinel empty-string user_id back to None.
+                if row.get("user_id") == "":
+                    row["user_id"] = None
+                filtered_metrics.append(row)
+
+                updated_at = metric.get("updated_at")
+                if updated_at and (latest_updated_at is None or updated_at > latest_updated_at):
+                    latest_updated_at = updated_at
+
+            return filtered_metrics, latest_updated_at
+
+        except Exception as e:
+            log_error(f"Exception getting metrics: {str(e)}")
+            raise e
+
+    # -- Knowledge methods --
+
+    @staticmethod
+    def _knowledge_item_is_visible(item: Dict[str, Any], user_id: Optional[str]) -> bool:
+        if user_id is None:
+            return True
+        owner = item.get("user_id")
+        return owner is None or owner == user_id
+
+    def delete_knowledge_content(self, id: str, user_id: Optional[str] = None):
+        """Delete a knowledge row from the database.
+
+        Args:
+            id (str): The ID of the knowledge row to delete.
+            user_id (Optional[str]): When set, only deletes rows owned by this user; unowned rows are kept.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            knowledge_items = self._read_json_file(self.knowledge_table_name)
+            knowledge_items = [
+                item
+                for item in knowledge_items
+                if not (item.get("id") == id and (user_id is None or item.get("user_id") == user_id))
+            ]
+            self._write_json_file(self.knowledge_table_name, knowledge_items)
+
+        except Exception as e:
+            log_error(f"Error deleting knowledge content: {str(e)}")
+            raise e
+
+    def get_knowledge_content(self, id: str, user_id: Optional[str] = None) -> Optional[KnowledgeRow]:
+        """Get a knowledge row from the database.
+
+        Args:
+            id (str): The ID of the knowledge row to get.
+            user_id (Optional[str]): Filter to rows owned by this user or unowned (shared) rows.
+
+        Returns:
+            Optional[KnowledgeRow]: The knowledge row, or None if it doesn't exist.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            knowledge_items = self._read_json_file(self.knowledge_table_name)
+
+            for item in knowledge_items:
+                if item.get("id") == id and self._knowledge_item_is_visible(item, user_id):
+                    return KnowledgeRow.model_validate(item)
+
+            return None
+
+        except Exception as e:
+            log_error(f"Error getting knowledge content: {str(e)}")
+            raise e
+
+    def get_knowledge_contents(
+        self,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        linked_to: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Tuple[List[KnowledgeRow], int]:
+        """Get all knowledge contents from the database.
+
+        Args:
+            limit (Optional[int]): The maximum number of knowledge contents to return.
+            page (Optional[int]): The page number.
+            sort_by (Optional[str]): The column to sort by.
+            sort_order (Optional[str]): The order to sort by.
+            linked_to (Optional[str]): Filter by linked_to value (knowledge instance name).
+            user_id (Optional[str]): Filter to rows owned by this user or unowned (shared) rows.
+
+        Returns:
+            Tuple[List[KnowledgeRow], int]: The knowledge contents and total count.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            knowledge_items = self._read_json_file(self.knowledge_table_name)
+
+            # Apply linked_to filter if provided
+            if linked_to is not None:
+                knowledge_items = [item for item in knowledge_items if item.get("linked_to") == linked_to]
+
+            # Apply owner scoping filter if provided
+            if user_id is not None:
+                knowledge_items = [item for item in knowledge_items if self._knowledge_item_is_visible(item, user_id)]
+
+            total_count = len(knowledge_items)
+
+            # Apply sorting
+            knowledge_items = apply_sorting(knowledge_items, sort_by, sort_order)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                knowledge_items = knowledge_items[start_idx : start_idx + limit]
+
+            return [KnowledgeRow.model_validate(item) for item in knowledge_items], total_count
+
+        except Exception as e:
+            log_error(f"Error getting knowledge contents: {str(e)}")
+            raise e
+
+    def upsert_knowledge_content(self, knowledge_row: KnowledgeRow):
+        """Upsert knowledge content in the database.
+
+        Args:
+            knowledge_row (KnowledgeRow): The knowledge row to upsert.
+
+        Returns:
+            Optional[KnowledgeRow]: The upserted knowledge row, or None if the operation fails.
+
+        Raises:
+            Exception: If an error occurs during upsert.
+        """
+        try:
+            knowledge_items = self._read_json_file(self.knowledge_table_name, create_table_if_not_found=True)
+            knowledge_dict = knowledge_row.model_dump()
+
+            # Find existing item to update
+            item_updated = False
+            for i, existing_item in enumerate(knowledge_items):
+                if existing_item.get("id") == knowledge_row.id:
+                    # A scoped write must not overwrite an item it does not own
+                    if knowledge_row.user_id is not None and existing_item.get("user_id") != knowledge_row.user_id:
+                        raise ValueError(f"Knowledge content {knowledge_row.id} not found")
+                    knowledge_items[i] = knowledge_dict
+                    item_updated = True
+                    break
+
+            if not item_updated:
+                knowledge_items.append(knowledge_dict)
+
+            self._write_json_file(self.knowledge_table_name, knowledge_items)
+
+            return knowledge_row
+
+        except Exception as e:
+            log_error(f"Error upserting knowledge row: {str(e)}")
+            raise e
+
+    # -- Eval methods --
+
+    def create_eval_run(self, eval_run: EvalRunRecord) -> Optional[EvalRunRecord]:
+        """Create an EvalRunRecord in the JSON file."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name, create_table_if_not_found=True)
+
+            current_time = int(time.time())
+            eval_dict = eval_run.model_dump()
+            eval_dict["created_at"] = current_time
+            eval_dict["updated_at"] = current_time
+
+            eval_runs.append(eval_dict)
+            self._write_json_file(self.eval_table_name, eval_runs)
+
+            log_debug(f"Created eval run with id '{eval_run.run_id}'")
+
+            return eval_run
+
+        except Exception as e:
+            log_error(f"Error creating eval run: {str(e)}")
+            raise e
+
+    def delete_eval_run(self, eval_run_id: str) -> None:
+        """Delete an eval run from the JSON file."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+            original_count = len(eval_runs)
+            eval_runs = [run for run in eval_runs if run.get("run_id") != eval_run_id]
+
+            if len(eval_runs) < original_count:
+                self._write_json_file(self.eval_table_name, eval_runs)
+                log_debug(f"Deleted eval run with ID: {eval_run_id}")
+            else:
+                log_debug(f"No eval run found with ID: {eval_run_id}")
+
+        except Exception as e:
+            log_error(f"Error deleting eval run {eval_run_id}: {str(e)}")
+            raise e
+
+    def delete_eval_runs(self, eval_run_ids: List[str], user_id: Optional[str] = None) -> None:
+        """Delete multiple eval runs from the JSON file."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+            original_count = len(eval_runs)
+            eval_runs = [
+                run
+                for run in eval_runs
+                if not (run.get("run_id") in eval_run_ids and (user_id is None or run.get("user_id") == user_id))
+            ]
+
+            deleted_count = original_count - len(eval_runs)
+            if deleted_count > 0:
+                self._write_json_file(self.eval_table_name, eval_runs)
+                log_debug(f"Deleted {deleted_count} eval runs")
+            else:
+                log_debug(f"No eval runs found with IDs: {eval_run_ids}")
+
+        except Exception as e:
+            log_error(f"Error deleting eval runs {eval_run_ids}: {str(e)}")
+            raise e
+
+    def get_eval_run(
+        self, eval_run_id: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
+    ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
+        """Get an eval run from the JSON file."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+
+            for run_data in eval_runs:
+                if run_data.get("run_id") == eval_run_id:
+                    if user_id is not None and run_data.get("user_id") != user_id:
+                        return None
+                    if not deserialize:
+                        return run_data
+                    return EvalRunRecord.model_validate(run_data)
+
+            return None
+
+        except Exception as e:
+            log_error(f"Exception getting eval run {eval_run_id}: {str(e)}")
+            raise e
+
+    def get_eval_runs(
+        self,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        filter_type: Optional[EvalFilterType] = None,
+        eval_type: Optional[List[EvalType]] = None,
+        deserialize: Optional[bool] = True,
+        user_id: Optional[str] = None,
+    ) -> Union[List[EvalRunRecord], Tuple[List[Dict[str, Any]], int]]:
+        """Get all eval runs from the JSON file with filtering and pagination."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+
+            # Apply filters
+            filtered_runs = []
+            for run_data in eval_runs:
+                if agent_id is not None and run_data.get("agent_id") != agent_id:
+                    continue
+                if team_id is not None and run_data.get("team_id") != team_id:
+                    continue
+                if workflow_id is not None and run_data.get("workflow_id") != workflow_id:
+                    continue
+                if model_id is not None and run_data.get("model_id") != model_id:
+                    continue
+                if user_id is not None and run_data.get("user_id") != user_id:
+                    continue
+                if eval_type is not None and len(eval_type) > 0:
+                    if run_data.get("eval_type") not in eval_type:
+                        continue
+                if filter_type is not None:
+                    if filter_type == EvalFilterType.AGENT and run_data.get("agent_id") is None:
+                        continue
+                    elif filter_type == EvalFilterType.TEAM and run_data.get("team_id") is None:
+                        continue
+                    elif filter_type == EvalFilterType.WORKFLOW and run_data.get("workflow_id") is None:
+                        continue
+
+                filtered_runs.append(run_data)
+
+            total_count = len(filtered_runs)
+
+            # Apply sorting (default by created_at desc)
+            if sort_by is None:
+                filtered_runs.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+            else:
+                filtered_runs = apply_sorting(filtered_runs, sort_by, sort_order)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                filtered_runs = filtered_runs[start_idx : start_idx + limit]
+
+            if not deserialize:
+                return filtered_runs, total_count
+
+            return [EvalRunRecord.model_validate(run) for run in filtered_runs]
+
+        except Exception as e:
+            log_error(f"Exception getting eval runs: {str(e)}")
+            raise e
+
+    def rename_eval_run(
+        self, eval_run_id: str, name: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
+    ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
+        """Rename an eval run in the JSON file."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+
+            for i, run_data in enumerate(eval_runs):
+                if run_data.get("run_id") == eval_run_id:
+                    if user_id is not None and run_data.get("user_id") != user_id:
+                        return None
+                    run_data["name"] = name
+                    run_data["updated_at"] = int(time.time())
+                    eval_runs[i] = run_data
+                    self._write_json_file(self.eval_table_name, eval_runs)
+
+                    log_debug(f"Renamed eval run with id '{eval_run_id}' to '{name}'")
+
+                    if not deserialize:
+                        return run_data
+
+                    return EvalRunRecord.model_validate(run_data)
+
+            return None
+
+        except Exception as e:
+            log_error(f"Error renaming eval run {eval_run_id}: {str(e)}")
+            raise e
+
+    def update_eval_run_user_id(self, eval_run_id: str, user_id: str) -> None:
+        """Set the owner (user_id) on an existing eval run.
+
+        Args:
+            eval_run_id (str): The ID of the eval run to update.
+            user_id (str): The owner to set.
+        """
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+            for i, run_data in enumerate(eval_runs):
+                if run_data.get("run_id") == eval_run_id:
+                    run_data["user_id"] = user_id
+                    eval_runs[i] = run_data
+                    self._write_json_file(self.eval_table_name, eval_runs)
+                    break
+
+        except Exception as e:
+            log_error(f"Error setting owner on eval run {eval_run_id}: {str(e)}")
+            raise e
+
+    # --- Traces ---
+    def upsert_trace(self, trace: "Trace") -> None:
+        """Create or update a single trace record in the database.
+
+        Args:
+            trace: The Trace object to store (one per trace_id).
+        """
+        try:
+            traces = self._read_json_file(self.trace_table_name, create_table_if_not_found=True)
+
+            # Check if trace exists
+            existing_idx = None
+            for i, existing in enumerate(traces):
+                if existing.get("trace_id") == trace.trace_id:
+                    existing_idx = i
+                    break
+
+            if existing_idx is not None:
+                existing = traces[existing_idx]
+
+                # workflow (level 3) > team (level 2) > agent (level 1) > child/unknown (level 0)
+                def get_component_level(workflow_id, team_id, agent_id, name):
+                    is_root_name = ".run" in name or ".arun" in name
+                    if not is_root_name:
+                        return 0
+                    elif workflow_id:
+                        return 3
+                    elif team_id:
+                        return 2
+                    elif agent_id:
+                        return 1
+                    else:
+                        return 0
+
+                existing_level = get_component_level(
+                    existing.get("workflow_id"),
+                    existing.get("team_id"),
+                    existing.get("agent_id"),
+                    existing.get("name", ""),
+                )
+                new_level = get_component_level(trace.workflow_id, trace.team_id, trace.agent_id, trace.name)
+                should_update_name = new_level > existing_level
+
+                # Parse existing start_time to calculate correct duration
+                existing_start_time_str = existing.get("start_time")
+                if isinstance(existing_start_time_str, str):
+                    existing_start_time = datetime.fromisoformat(existing_start_time_str.replace("Z", "+00:00"))
+                else:
+                    existing_start_time = trace.start_time
+
+                recalculated_duration_ms = int((trace.end_time - existing_start_time).total_seconds() * 1000)
+
+                # Update existing trace
+                existing["end_time"] = trace.end_time.isoformat()
+                existing["duration_ms"] = recalculated_duration_ms
+                existing["status"] = trace.status
+                if should_update_name:
+                    existing["name"] = trace.name
+
+                # Preserve existing non-null context values: only fill in fields
+                # that the existing row left blank. Otherwise a later upsert from
+                # a child span (e.g. a post-hook agent's run with a different
+                # session_id) would overwrite the trace's already-correct context.
+                if existing.get("run_id") is None and trace.run_id is not None:
+                    existing["run_id"] = trace.run_id
+                if existing.get("session_id") is None and trace.session_id is not None:
+                    existing["session_id"] = trace.session_id
+                if existing.get("user_id") is None and trace.user_id is not None:
+                    existing["user_id"] = trace.user_id
+                if existing.get("agent_id") is None and trace.agent_id is not None:
+                    existing["agent_id"] = trace.agent_id
+                if existing.get("team_id") is None and trace.team_id is not None:
+                    existing["team_id"] = trace.team_id
+                if existing.get("workflow_id") is None and trace.workflow_id is not None:
+                    existing["workflow_id"] = trace.workflow_id
+
+                traces[existing_idx] = existing
+            else:
+                # Add new trace
+                trace_dict = trace.to_dict()
+                trace_dict.pop("total_spans", None)
+                trace_dict.pop("error_count", None)
+                traces.append(trace_dict)
+
+            self._write_json_file(self.trace_table_name, traces)
+
+        except Exception as e:
+            log_error(f"Error creating trace: {str(e)}")
+
+    def get_trace(
+        self,
+        trace_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ):
+        """Get a single trace by trace_id or other filters.
+
+        Args:
+            trace_id: The unique trace identifier.
+            run_id: Filter by run ID (returns first match).
+
+        Returns:
+            Optional[Trace]: The trace if found, None otherwise.
+        """
+        try:
+            from agno.tracing.schemas import Trace
+
+            traces = self._read_json_file(self.trace_table_name, create_table_if_not_found=False)
+            if not traces:
+                return None
+
+            # Get spans for calculating total_spans and error_count
+            spans = self._read_json_file(self.span_table_name, create_table_if_not_found=False)
+
+            # Filter traces
+            filtered = []
+            for t in traces:
+                if trace_id and t.get("trace_id") == trace_id:
+                    filtered.append(t)
+                    break
+                elif run_id and t.get("run_id") == run_id:
+                    filtered.append(t)
+
+            if not filtered:
+                return None
+
+            # Sort by start_time desc and get first
+            filtered.sort(key=lambda x: x.get("start_time", ""), reverse=True)
+            trace_data = filtered[0]
+
+            # Calculate total_spans and error_count
+            trace_spans = [s for s in spans if s.get("trace_id") == trace_data.get("trace_id")]
+            trace_data["total_spans"] = len(trace_spans)
+            trace_data["error_count"] = sum(1 for s in trace_spans if s.get("status_code") == "ERROR")
+
+            return Trace.from_dict(trace_data)
+
+        except Exception as e:
+            log_error(f"Error getting trace: {str(e)}")
+            return None
+
+    def get_traces(
+        self,
+        run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        status: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: Optional[int] = 20,
+        page: Optional[int] = 1,
+    ) -> tuple[List, int]:
+        """Get traces matching the provided filters with pagination.
+
+        Args:
+            run_id: Filter by run ID.
+            session_id: Filter by session ID.
+            user_id: Filter by user ID.
+            agent_id: Filter by agent ID.
+            team_id: Filter by team ID.
+            workflow_id: Filter by workflow ID.
+            status: Filter by status (OK, ERROR, UNSET).
+            start_time: Filter traces starting after this datetime.
+            end_time: Filter traces ending before this datetime.
+            limit: Maximum number of traces to return per page.
+            page: Page number (1-indexed).
+
+        Returns:
+            tuple[List[Trace], int]: Tuple of (list of matching traces, total count).
+        """
+        try:
+            from agno.tracing.schemas import Trace
+
+            traces = self._read_json_file(self.trace_table_name, create_table_if_not_found=False)
+            if not traces:
+                return [], 0
+
+            # Get spans for calculating total_spans and error_count
+            spans = self._read_json_file(self.span_table_name, create_table_if_not_found=False)
+
+            # Apply filters
+            filtered = []
+            for t in traces:
+                if run_id and t.get("run_id") != run_id:
+                    continue
+                if session_id and t.get("session_id") != session_id:
+                    continue
+                if user_id and t.get("user_id") != user_id:
+                    continue
+                if agent_id and t.get("agent_id") != agent_id:
+                    continue
+                if team_id and t.get("team_id") != team_id:
+                    continue
+                if workflow_id and t.get("workflow_id") != workflow_id:
+                    continue
+                if status and t.get("status") != status:
+                    continue
+                if start_time:
+                    trace_start = t.get("start_time", "")
+                    if trace_start < start_time.isoformat():
+                        continue
+                if end_time:
+                    trace_end = t.get("end_time", "")
+                    if trace_end > end_time.isoformat():
+                        continue
+                filtered.append(t)
+
+            total_count = len(filtered)
+
+            # Sort by start_time desc
+            filtered.sort(key=lambda x: x.get("start_time", ""), reverse=True)
+
+            # Apply pagination
+            if limit and page:
+                start_idx = (page - 1) * limit
+                filtered = filtered[start_idx : start_idx + limit]
+
+            # Add total_spans and error_count to each trace
+            result_traces = []
+            for t in filtered:
+                trace_spans = [s for s in spans if s.get("trace_id") == t.get("trace_id")]
+                t["total_spans"] = len(trace_spans)
+                t["error_count"] = sum(1 for s in trace_spans if s.get("status_code") == "ERROR")
+                result_traces.append(Trace.from_dict(t))
+
+            return result_traces, total_count
+
+        except Exception as e:
+            log_error(f"Error getting traces: {str(e)}")
+            return [], 0
+
+    def get_trace_stats(
+        self,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: Optional[int] = 20,
+        page: Optional[int] = 1,
+        group_by: Literal["session", "agent", "team", "workflow", "endpoint"] = "session",
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Get trace statistics grouped by session.
+
+        Args:
+            user_id: Filter by user ID.
+            agent_id: Filter by agent ID.
+            team_id: Filter by team ID.
+            workflow_id: Filter by workflow ID.
+            start_time: Filter sessions with traces created after this datetime.
+            end_time: Filter sessions with traces created before this datetime.
+            limit: Maximum number of sessions to return per page.
+            page: Page number (1-indexed).
+            group_by: Only the default "session" grouping is supported by this backend.
+
+        Returns:
+            tuple[List[Dict], int]: Tuple of (list of session stats dicts, total count).
+        """
+        if group_by != "session":
+            raise NotImplementedError(
+                f"get_trace_stats with group_by={group_by!r} is not supported by {self.__class__.__name__}. "
+                "Only the default 'session' grouping is available."
+            )
+        try:
+            traces = self._read_json_file(self.trace_table_name, create_table_if_not_found=False)
+            if not traces:
+                return [], 0
+
+            # Group by session_id
+            session_stats: Dict[str, Dict[str, Any]] = {}
+
+            for t in traces:
+                session_id = t.get("session_id")
+                if not session_id:
+                    continue
+
+                # Apply filters
+                if user_id and t.get("user_id") != user_id:
+                    continue
+                if agent_id and t.get("agent_id") != agent_id:
+                    continue
+                if team_id and t.get("team_id") != team_id:
+                    continue
+                if workflow_id and t.get("workflow_id") != workflow_id:
+                    continue
+
+                created_at = t.get("created_at", "")
+                if start_time and created_at < start_time.isoformat():
+                    continue
+                if end_time and created_at > end_time.isoformat():
+                    continue
+
+                if session_id not in session_stats:
+                    session_stats[session_id] = {
+                        "session_id": session_id,
+                        "user_id": t.get("user_id"),
+                        "agent_id": t.get("agent_id"),
+                        "team_id": t.get("team_id"),
+                        "workflow_id": t.get("workflow_id"),
+                        "total_traces": 0,
+                        "first_trace_at": created_at,
+                        "last_trace_at": created_at,
+                    }
+
+                session_stats[session_id]["total_traces"] += 1
+                if created_at < session_stats[session_id]["first_trace_at"]:
+                    session_stats[session_id]["first_trace_at"] = created_at
+                if created_at > session_stats[session_id]["last_trace_at"]:
+                    session_stats[session_id]["last_trace_at"] = created_at
+
+            stats_list = list(session_stats.values())
+            total_count = len(stats_list)
+
+            # Sort by last_trace_at desc
+            stats_list.sort(key=lambda x: x.get("last_trace_at", ""), reverse=True)
+
+            # Apply pagination
+            if limit and page:
+                start_idx = (page - 1) * limit
+                stats_list = stats_list[start_idx : start_idx + limit]
+
+            # Convert ISO strings to datetime objects
+            for stat in stats_list:
+                first_at = stat.get("first_trace_at", "")
+                last_at = stat.get("last_trace_at", "")
+                if first_at:
+                    stat["first_trace_at"] = datetime.fromisoformat(first_at.replace("Z", "+00:00"))
+                if last_at:
+                    stat["last_trace_at"] = datetime.fromisoformat(last_at.replace("Z", "+00:00"))
+
+            return stats_list, total_count
+
+        except Exception as e:
+            log_error(f"Error getting trace stats: {str(e)}")
+            return [], 0
+
+    # --- Spans ---
+    def create_span(self, span: "Span") -> None:
+        """Create a single span in the database.
+
+        Args:
+            span: The Span object to store.
+        """
+        try:
+            spans = self._read_json_file(self.span_table_name, create_table_if_not_found=True)
+            spans.append(span.to_dict())
+            self._write_json_file(self.span_table_name, spans)
+
+        except Exception as e:
+            log_error(f"Error creating span: {str(e)}")
+
+    def create_spans(self, spans: List) -> None:
+        """Create multiple spans in the database as a batch.
+
+        Args:
+            spans: List of Span objects to store.
+        """
+        if not spans:
+            return
+
+        try:
+            existing_spans = self._read_json_file(self.span_table_name, create_table_if_not_found=True)
+            for span in spans:
+                existing_spans.append(span.to_dict())
+            self._write_json_file(self.span_table_name, existing_spans)
+
+        except Exception as e:
+            log_error(f"Error creating spans batch: {str(e)}")
+
+    def get_span(self, span_id: str):
+        """Get a single span by its span_id.
+
+        Args:
+            span_id: The unique span identifier.
+
+        Returns:
+            Optional[Span]: The span if found, None otherwise.
+        """
+        try:
+            from agno.tracing.schemas import Span
+
+            spans = self._read_json_file(self.span_table_name, create_table_if_not_found=False)
+
+            for s in spans:
+                if s.get("span_id") == span_id:
+                    return Span.from_dict(s)
+
+            return None
+
+        except Exception as e:
+            log_error(f"Error getting span: {str(e)}")
+            return None
+
+    def get_spans(
+        self,
+        trace_id: Optional[str] = None,
+        parent_span_id: Optional[str] = None,
+        limit: Optional[int] = 1000,
+    ) -> List:
+        """Get spans matching the provided filters.
+
+        Args:
+            trace_id: Filter by trace ID.
+            parent_span_id: Filter by parent span ID.
+            limit: Maximum number of spans to return.
+
+        Returns:
+            List[Span]: List of matching spans.
+        """
+        try:
+            from agno.tracing.schemas import Span
+
+            spans = self._read_json_file(self.span_table_name, create_table_if_not_found=False)
+            if not spans:
+                return []
+
+            # Apply filters
+            filtered = []
+            for s in spans:
+                if trace_id and s.get("trace_id") != trace_id:
+                    continue
+                if parent_span_id and s.get("parent_span_id") != parent_span_id:
+                    continue
+                filtered.append(s)
+
+            # Apply limit
+            if limit:
+                filtered = filtered[:limit]
+
+            return [Span.from_dict(s) for s in filtered]
+
+        except Exception as e:
+            log_error(f"Error getting spans: {str(e)}")
+            return []
+
+    # -- Learning methods (stubs) --
+    def get_learning(
+        self,
+        learning_type: str,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        entity_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError("Learning methods not yet implemented for JsonDb")
+
+    def upsert_learning(
+        self,
+        id: str,
+        learning_type: str,
+        content: Dict[str, Any],
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        raise NotImplementedError("Learning methods not yet implemented for JsonDb")
+
+    def delete_learning(self, id: str) -> bool:
+        raise NotImplementedError("Learning methods not yet implemented for JsonDb")
+
+    def get_learnings(
+        self,
+        learning_type: Optional[str] = None,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError("Learning methods not yet implemented for JsonDb")

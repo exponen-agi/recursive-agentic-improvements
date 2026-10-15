@@ -61,3 +61,16 @@ jobs:
       - name: Run installer unit tests (node:test — no extra dependency)
         working-directory: installer
         run: npm test
+
+  version-sync:
+    name: version pins match docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Run version sync test
+        run: uv run --no-project --with pytest pytest tests/test_version_sync.py -v

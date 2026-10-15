@@ -1,0 +1,175 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import logging
+from typing import Callable
+from typing import Dict
+from typing import List
+
+import httpx
+from typing_extensions import override
+
+from ...agents.readonly_context import ReadonlyContext
+from ...auth.auth_credential import ServiceAccount
+from ...auth.auth_schemes import OpenIdConnectWithConfig
+from ...tools.base_toolset import BaseToolset
+from ...tools.base_toolset import ToolPredicate
+from ...utils._mtls_utils import MtlsClientCerts
+from ...utils._mtls_utils import use_client_cert_effective
+from ..openapi_tool import OpenAPIToolset
+from .google_api_tool import GoogleApiTool
+from .googleapi_to_openapi_converter import GoogleApiToOpenApiConverter
+
+logger = logging.getLogger('google_adk.' + __name__)
+
+
+class GoogleApiToolset(BaseToolset):
+  """Google API Toolset contains tools for interacting with Google APIs.
+
+  Usually one toolsets will contain tools only related to one Google API, e.g.
+  Google Bigquery API toolset will contain tools only related to Google
+  Bigquery API, like list dataset tool, list table tool etc.
+
+  Args:
+    api_name: The name of the Google API (e.g., "calendar", "gmail").
+    api_version: The version of the API (e.g., "v3", "v1").
+    client_id: OAuth2 client ID for authentication.
+    client_secret: OAuth2 client secret for authentication.
+    tool_filter: Optional filter to include only specific tools or use a predicate function.
+    service_account: Optional service account for authentication.
+    tool_name_prefix: Optional prefix to add to all tool names in this toolset.
+    additional_headers: Optional dict of HTTP headers to inject into every request
+      executed by this toolset.
+    additional_scopes: Optional list of additional scopes to request.
+    discovery_url: Optional custom discovery URL to use for the API.
+  """
+
+  def __init__(
+      self,
+      api_name: str,
+      api_version: str,
+      client_id: str | None = None,
+      client_secret: str | None = None,
+      tool_filter: ToolPredicate | List[str] | None = None,
+      service_account: ServiceAccount | None = None,
+      tool_name_prefix: str | None = None,
+      *,
+      additional_headers: Dict[str, str] | None = None,
+      additional_scopes: List[str] | None = None,
+      discovery_url: str | None = None,
+  ):
+    super().__init__(tool_filter=tool_filter, tool_name_prefix=tool_name_prefix)
+    self.api_name = api_name
+    self.api_version = api_version
+    self._client_id = client_id
+    self._client_secret = client_secret
+    self._service_account = service_account
+    self._additional_headers = additional_headers
+    self._additional_scopes = additional_scopes
+    self._discovery_url = discovery_url
+
+    self._httpx_client_factory: Callable[[], httpx.AsyncClient] | None = None
+    self._mtls_certs: MtlsClientCerts | None = None
+    use_client_cert = use_client_cert_effective()
+
+    if use_client_cert:
+      self._mtls_certs = MtlsClientCerts()
+      cert_path, key_path, passphrase = self._mtls_certs.get_certs()
+      if cert_path and key_path:
+
+        def client_factory() -> httpx.AsyncClient:
+          if passphrase:
+            return httpx.AsyncClient(
+                cert=(cert_path, key_path, passphrase)  # type: ignore[arg-type]
+            )
+          return httpx.AsyncClient(cert=(cert_path, key_path))
+
+        self._httpx_client_factory = client_factory
+
+    self._openapi_toolset = self._load_toolset_with_oidc_auth()
+
+  @override
+  # list is invariant, so the narrower element type is not a compatible
+  # override; widening it to BaseTool would change this public signature.
+  async def get_tools(  # type: ignore[override]
+      self, readonly_context: ReadonlyContext | None = None
+  ) -> List[GoogleApiTool]:
+    """Get all tools in the toolset."""
+    return [
+        GoogleApiTool(
+            tool,
+            self._client_id,
+            self._client_secret,
+            self._service_account,
+            additional_headers=self._additional_headers,
+        )
+        for tool in await self._openapi_toolset.get_tools(readonly_context)
+        if self._is_tool_selected(tool, readonly_context)
+    ]
+
+  def set_tool_filter(self, tool_filter: ToolPredicate | List[str]) -> None:
+    self.tool_filter = tool_filter
+
+  def _load_toolset_with_oidc_auth(self) -> OpenAPIToolset:
+    spec_dict = GoogleApiToOpenApiConverter(
+        self.api_name, self.api_version, discovery_url=self._discovery_url
+    ).convert()
+    discovery_scopes = list(
+        spec_dict['components']['securitySchemes']['oauth2']['flows'][
+            'authorizationCode'
+        ]['scopes'].keys()
+    )
+    default_scope = discovery_scopes[0] if discovery_scopes else None
+
+    scopes = list(
+        dict.fromkeys(
+            ([default_scope] if default_scope else [])
+            + (self._additional_scopes or [])
+        )
+    )
+
+    return OpenAPIToolset(
+        spec_dict=spec_dict,
+        spec_str_type='yaml',
+        auth_scheme=OpenIdConnectWithConfig(
+            authorization_endpoint=(
+                'https://accounts.google.com/o/oauth2/v2/auth'
+            ),
+            token_endpoint='https://oauth2.googleapis.com/token',
+            revocation_endpoint='https://oauth2.googleapis.com/revoke',
+            token_endpoint_auth_methods_supported=[
+                'client_secret_post',
+                'client_secret_basic',
+            ],
+            grant_types_supported=['authorization_code'],
+            scopes=scopes,
+        ),
+        httpx_client_factory=self._httpx_client_factory,
+    )
+
+  def configure_auth(self, client_id: str, client_secret: str) -> None:
+    self._client_id = client_id
+    self._client_secret = client_secret
+
+  def configure_sa_auth(self, service_account: ServiceAccount) -> None:
+    self._service_account = service_account
+
+  @override
+  async def close(self) -> None:
+    if self._openapi_toolset:
+      await self._openapi_toolset.close()
+    if self._mtls_certs:
+      self._mtls_certs.close()

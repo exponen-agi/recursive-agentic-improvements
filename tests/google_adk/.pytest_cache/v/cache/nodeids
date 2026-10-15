@@ -1,0 +1,7 @@
+[
+  "test_google_adk.py::test_fetch_weather_tool_isolated",
+  "test_google_adk.py::test_google_adk_agent_static",
+  "test_google_adk.py::test_google_adk_runner_constraint_refusal",
+  "test_google_adk.py::test_google_adk_runner_edge_case",
+  "test_google_adk.py::test_google_adk_runner_happy_path"
+]

@@ -1,0 +1,1881 @@
+import asyncio
+import re
+from hashlib import md5
+from math import sqrt
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
+
+from agno.utils.string import generate_id
+
+try:
+    from sqlalchemy import and_, not_, null, or_, update
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.engine import Engine, create_engine
+    from sqlalchemy.exc import NoSuchTableError
+    from sqlalchemy.inspection import inspect
+    from sqlalchemy.orm import Session, scoped_session, sessionmaker
+    from sqlalchemy.schema import Column, Index, MetaData, Table
+    from sqlalchemy.sql.elements import ColumnElement
+    from sqlalchemy.sql.expression import bindparam, desc, func, literal_column, select, text
+    from sqlalchemy.types import DateTime, Integer, String
+
+except ImportError:
+    raise ImportError("`sqlalchemy` not installed. Please install using `pip install sqlalchemy psycopg`")
+
+try:
+    from pgvector.sqlalchemy import Vector
+except ImportError:
+    raise ImportError("`pgvector` not installed. Please install using `pip install pgvector`")
+
+from datetime import datetime
+
+from agno.exceptions import EmbeddingError
+from agno.filters import FilterExpr
+from agno.knowledge.document import Document
+from agno.knowledge.embedder import Embedder
+from agno.knowledge.reranker.base import Reranker
+from agno.knowledge.utils import STORE_RECENCY_METADATA_KEY
+from agno.utils.log import log_debug, log_error, log_info, log_warning
+from agno.vectordb.base import (
+    VectorDb,
+    aembed_before_replace,
+    embed_before_replace,
+    is_rate_limit_error,
+    raise_embedding_failures,
+    retrievable_documents,
+)
+from agno.vectordb.distance import Distance
+from agno.vectordb.pgvector.index import HNSW, Ivfflat
+from agno.vectordb.score import normalize_score, score_to_distance_threshold
+from agno.vectordb.search import SearchType
+
+if TYPE_CHECKING:
+    from agno.db.postgres import PostgresDb
+
+
+# ts_rank_cd returns small unbounded values, so a rank is reported on a 0-1 scale with
+# x/(x+k). Shared by keyword and hybrid search, which must agree on the scale.
+_RANK_NORMALIZATION_K = 0.1
+
+
+def _normalized_rank(rank: Any) -> Any:
+    """Map a ts_rank_cd expression onto 0-1."""
+    return rank / (rank + _RANK_NORMALIZATION_K)
+
+
+class PgVector(VectorDb):
+    """
+    PgVector class for managing vector operations with PostgreSQL and pgvector.
+
+    This class provides methods for creating, inserting, searching, and managing
+    vector data in a PostgreSQL database using the pgvector extension.
+    """
+
+    def __init__(
+        self,
+        table_name: str,
+        schema: str = "ai",
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        id: Optional[str] = None,
+        db_url: Optional[str] = None,
+        db_engine: Optional[Engine] = None,
+        embedder: Optional[Embedder] = None,
+        search_type: SearchType = SearchType.vector,
+        vector_index: Union[Ivfflat, HNSW] = HNSW(),
+        distance: Distance = Distance.cosine,
+        prefix_match: bool = False,
+        vector_score_weight: float = 0.5,
+        content_language: str = "english",
+        schema_version: int = 1,
+        reranker: Optional[Reranker] = None,
+        return_updated_at: bool = False,
+        create_schema: bool = True,
+        similarity_threshold: Optional[float] = None,
+        *,
+        db: Optional["PostgresDb"] = None,
+    ):
+        """
+        Initialize the PgVector instance.
+
+        Args:
+            table_name (str): Name of the table to store vector data.
+            schema (str): Database schema name.
+            name (Optional[str]): Name of the vector database.
+            description (Optional[str]): Description of the vector database.
+            db_url (Optional[str]): Database connection URL.
+            db_engine (Optional[Engine]): SQLAlchemy database engine.
+            db (Optional[PostgresDb]): Borrow a synchronous PostgreSQL database's engine.
+                Cannot be combined with db_url or db_engine; does not transfer ownership.
+            embedder (Optional[Embedder]): Embedder instance for creating embeddings.
+            search_type (SearchType): Type of search to perform.
+            vector_index (Union[Ivfflat, HNSW]): Vector index configuration.
+            distance (Distance): Distance metric for vector comparisons.
+            prefix_match (bool): Enable prefix matching for full-text search.
+            vector_score_weight (float): Weight for vector similarity in hybrid search.
+            content_language (str): Language for full-text search.
+            schema_version (int): Version of the database schema.
+            reranker (Optional[Reranker]): Reranker instance for reranking search results. Deprecated: pass the reranker to Knowledge instead.
+            create_schema (bool): Whether to automatically create the database schema if it doesn't exist.
+                Set to False if schema is managed externally (e.g., via migrations). Defaults to True.
+            similarity_threshold (Optional[float]): Minimum similarity score (0.0-1.0) to filter results.
+        """
+        if not table_name:
+            raise ValueError("Table name must be provided.")
+
+        if db is not None:
+            from agno.db.postgres import PostgresDb
+
+            if db_url is not None or db_engine is not None:
+                raise ValueError("Provide db alone, without db_url or db_engine")
+            if (
+                not isinstance(db, PostgresDb)
+                or not isinstance(db.db_engine, Engine)
+                or db.db_engine.dialect.name != "postgresql"
+            ):
+                raise ValueError("db requires a synchronous PostgresDb; use db_engine for a direct engine")
+            db_engine = db.db_engine
+        if db_engine is None and db_url is None:
+            raise ValueError("Provide db, db_url, or db_engine")
+
+        if id is None:
+            base_seed = db_url or str(db_engine.url)  # type: ignore
+            schema_suffix = table_name if table_name is not None else "ai"
+            seed = f"{base_seed}#{schema_suffix}"
+            id = generate_id(seed)
+
+        # Initialize base class
+        super().__init__(id=id, name=name, description=description, similarity_threshold=similarity_threshold)
+
+        if db_engine is None:
+            if db_url is None:
+                raise ValueError("Must provide 'db_url' if 'db_engine' is None.")
+            try:
+                db_engine = create_engine(db_url)
+            except Exception as e:
+                log_error(f"Failed to create engine from 'db_url': {str(e)}")
+                raise
+
+        # Database settings
+        self.table_name: str = table_name
+        self.schema: str = schema
+        self.db_url: Optional[str] = db_url
+        self.db_engine: Engine = db_engine
+        self.metadata: MetaData = MetaData(schema=self.schema)
+
+        # Embedder for embedding the document contents
+        if embedder is None:
+            from agno.knowledge.embedder.openai import OpenAIEmbedder
+
+            embedder = OpenAIEmbedder()
+            log_debug("Embedder not provided, using OpenAIEmbedder as default.")
+        self.embedder: Embedder = embedder
+        self.dimensions: Optional[int] = self.embedder.dimensions
+
+        if self.dimensions is None:
+            raise ValueError("Embedder.dimensions must be set.")
+
+        # Search type
+        self.search_type: SearchType = search_type
+        # Distance metric
+        self.distance: Distance = distance
+        # Index for the table
+        self.vector_index: Union[Ivfflat, HNSW] = vector_index
+        # Enable prefix matching for full-text search
+        self.prefix_match: bool = prefix_match
+        # Weight for the vector similarity score in hybrid search
+        self.vector_score_weight: float = vector_score_weight
+        # Content language for full-text search
+        self.content_language: str = content_language
+
+        # Table schema version
+        self.schema_version: int = schema_version
+
+        # Reranker instance
+        self.reranker: Optional[Reranker] = reranker
+        # Off by default: the timestamp lands in meta_data, which is serialized into the
+        # model's prompt, so only stores whose caller wants recency ranking should pay for it.
+        self.return_updated_at: bool = return_updated_at
+
+        # Schema creation flag
+        self.create_schema: bool = create_schema
+
+        # Database session
+        self.Session: scoped_session = scoped_session(sessionmaker(bind=self.db_engine))
+        # Whether the live table has the ``user_id`` column; pre-v3 tables lack it
+        self._owner_column_exists: Optional[bool] = None
+        # Database table
+        self.table: Table = self.get_table()
+        log_debug(f"Initialized PgVector with table '{self.schema}.{self.table_name}'", log_level=2)
+
+    def _replace_page_on(self, conn, content_id: str, records: List[Dict[str, Any]]) -> None:
+        """Replace already embedded page records using the caller's transaction."""
+        conn.execute(self.table.delete().where(self.table.c.content_id == content_id))
+        for start in range(0, len(records), 100):
+            conn.execute(self.table.insert(), records[start : start + 100])
+
+    def get_table_v1(self) -> Table:
+        """
+        Get the SQLAlchemy Table object for schema version 1.
+
+        Returns:
+            Table: SQLAlchemy Table object representing the database table.
+        """
+        if self.dimensions is None:
+            raise ValueError("Embedder dimensions are not set.")
+        table = Table(
+            self.table_name,
+            self.metadata,
+            Column("id", String, primary_key=True),
+            Column("name", String),
+            Column("meta_data", postgresql.JSONB, server_default=text("'{}'::jsonb")),
+            Column("filters", postgresql.JSONB, server_default=text("'{}'::jsonb"), nullable=True),
+            Column("content", postgresql.TEXT),
+            Column("embedding", Vector(self.dimensions)),
+            Column("usage", postgresql.JSONB),
+            Column("created_at", DateTime(timezone=True), server_default=func.now()),
+            Column("updated_at", DateTime(timezone=True), onupdate=func.now()),
+            Column("content_hash", String),
+            Column("content_id", String),
+            # Owner of the chunk. ``NULL`` is shared content, readable by every caller.
+            Column("user_id", String, nullable=True),
+            extend_existing=True,
+        )
+
+        # Add indexes
+        Index(f"idx_{self.table_name}_id", table.c.id)
+        Index(f"idx_{self.table_name}_name", table.c.name)
+        Index(f"idx_{self.table_name}_content_hash", table.c.content_hash)
+        Index(f"idx_{self.table_name}_content_id", table.c.content_id)
+        Index(f"idx_{self.table_name}_user_id", table.c.user_id)
+        return table
+
+    def get_table(self) -> Table:
+        """
+        Get the SQLAlchemy Table object based on the current schema version.
+
+        Returns:
+            Table: SQLAlchemy Table object representing the database table.
+        """
+        if self.schema_version == 1:
+            return self.get_table_v1()
+        else:
+            raise NotImplementedError(f"Unsupported schema version: {self.schema_version}")
+
+    def table_exists(self) -> bool:
+        """
+        Check if the table exists in the database.
+
+        Returns:
+            bool: True if the table exists, False otherwise.
+        """
+        log_debug(f"Checking table {self.table.fullname}", log_level=2)
+        try:
+            return inspect(self.db_engine).has_table(self.table_name, schema=self.schema)
+        except Exception as e:
+            log_error(f"Error checking if table exists: {str(e)}")
+            return False
+
+    def create(self) -> None:
+        """
+        Create the table if it does not exist.
+        """
+        if not self.table_exists():
+            with self.Session() as sess, sess.begin():
+                log_debug("Ensuring extension vector", log_level=2)
+                sess.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                if self.create_schema and self.schema is not None:
+                    try:
+                        log_debug(f"Ensuring schema {self.schema}", log_level=2)
+                        sess.execute(text(f"CREATE SCHEMA IF NOT EXISTS {self.schema};"))
+                    except Exception as e:
+                        log_warning(f"Could not create schema {self.schema}: {str(e)}")
+            self.table.create(self.db_engine)
+            log_debug(f"Created table {self.table.fullname}")
+            self._owner_column_exists = True
+
+    async def async_create(self) -> None:
+        """Create the table asynchronously by running in a thread."""
+        await asyncio.to_thread(self.create)
+
+    def _user_id_column_exists(self) -> bool:
+        """Whether the live table has the ``user_id`` column. Inspected once, then cached."""
+        if self._owner_column_exists is None:
+            try:
+                columns = inspect(self.db_engine).get_columns(self.table_name, schema=self.schema)
+                self._owner_column_exists = any(col["name"] == "user_id" for col in columns)
+            except NoSuchTableError:
+                # No live table yet — it will be created with the column.
+                self._owner_column_exists = True
+            except Exception:
+                # Assume migrated, uncached: caching a failed inspection would mask a legacy table
+                log_warning(
+                    f"Could not inspect table '{self.table_name}' for the user_id column; "
+                    "proceeding as migrated for this operation."
+                )
+                return True
+        return self._owner_column_exists
+
+    def _require_owner_column(self, user_id: Optional[str]) -> bool:
+        """Gate every ``user_id``-column reference on the live schema.
+
+        Returns True when the column exists and False when it is missing and the call is
+        unscoped, so the caller can fall back to SQL that never mentions the column. A scoped
+        call on an unmigrated table raises.
+        """
+        if self._user_id_column_exists():
+            return True
+        if user_id is None:
+            return False
+        # The cached answer may predate a migration run — re-inspect once before refusing
+        self._owner_column_exists = None
+        if self._user_id_column_exists():
+            return True
+        raise ValueError(
+            f"user_id={user_id!r} was passed but table '{self.table.fullname}' predates per-user "
+            "isolation and has no 'user_id' column. Run the v2 -> v3 migration "
+            "(libs/agno/migrations/v2_to_v3/migrate_sql_vectordbs.py) or recreate the table."
+        )
+
+    def _record_exists(self, column, value, scope_to_owner: bool = False, user_id: Optional[str] = None) -> bool:
+        """
+        Check if a record with the given column value exists in the table.
+
+        Args:
+            column: The column to check.
+            value: The value to search for.
+            scope_to_owner: Also require the row's owner to match ``user_id``.
+            user_id: The owner to match when scoping; None matches the shared bucket.
+
+        Returns:
+            bool: True if the record exists, False otherwise.
+        """
+        # Outside the try so a scoped check raises instead of returning False
+        scope_to_owner = scope_to_owner and self._require_owner_column(user_id)
+        try:
+            with self.Session() as sess, sess.begin():
+                stmt = select(1).where(column == value)
+                if scope_to_owner:
+                    if user_id is not None:
+                        stmt = stmt.where(self.table.c.user_id == user_id)
+                    else:
+                        stmt = stmt.where(self.table.c.user_id.is_(None))
+                result = sess.execute(stmt.limit(1)).first()
+                return result is not None
+        except Exception as e:
+            log_error(f"Error checking if record exists: {str(e)}")
+            return False
+
+    def name_exists(self, name: str) -> bool:
+        """
+        Check if a document with the given name exists in the table.
+
+        Args:
+            name (str): The name to check.
+
+        Returns:
+            bool: True if a document with the name exists, False otherwise.
+        """
+        return self._record_exists(self.table.c.name, name)
+
+    async def async_name_exists(self, name: str) -> bool:
+        """Check if name exists asynchronously by running in a thread."""
+        return await asyncio.to_thread(self.name_exists, name)
+
+    def id_exists(self, id: str) -> bool:
+        """
+        Check if a document with the given ID exists in the table.
+
+        Args:
+            id (str): The ID to check.
+
+        Returns:
+            bool: True if a document with the ID exists, False otherwise.
+        """
+        return self._record_exists(self.table.c.id, id)
+
+    def content_hash_exists(self, content_hash: str, user_id: Optional[str] = None) -> bool:
+        """
+        Check if a document with the given content hash exists in the table.
+
+        Args:
+            content_hash (str): The content hash to check.
+            user_id (Optional[str]): Scope the check to this user's rows. None scopes to the
+                shared bucket (``user_id IS NULL``), the same bucket ``_delete_by_content_hash`` clears.
+        """
+        return self._record_exists(self.table.c.content_hash, content_hash, scope_to_owner=True, user_id=user_id)
+
+    def _clean_content(self, content: str) -> str:
+        """
+        Clean the content by replacing null characters.
+
+        Args:
+            content (str): The content to clean.
+
+        Returns:
+            str: The cleaned content.
+        """
+        return content.replace("\x00", "\ufffd")
+
+    def insert(
+        self,
+        content_hash: str,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+        batch_size: int = 100,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """
+        Insert documents into the database.
+
+        Args:
+            content_hash (str): The content hash to insert.
+            documents (List[Document]): List of documents to insert.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the documents.
+            batch_size (int): Number of documents to insert in each batch.
+            user_id (Optional[str]): Owner of these chunks. ``None`` means shared.
+        """
+        self._require_owner_column(user_id)
+        try:
+            with self.Session() as sess:
+                for i in range(0, len(documents), batch_size):
+                    batch_docs = documents[i : i + batch_size]
+                    log_debug(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
+                    try:
+                        # Prepare documents for insertion
+                        batch_records = []
+                        for doc in batch_docs:
+                            try:
+                                batch_records.append(self._get_document_record(doc, filters, content_hash, user_id))
+                            except EmbeddingError:
+                                # A chunk that did not embed is unretrievable. Dropping it here
+                                # would commit the rest of the batch and report success, so the
+                                # failure is raised for ingestion to retry and record.
+                                raise
+                            except Exception as e:
+                                log_error(f"Error processing document '{doc.name}': {str(e)}")
+
+                        # An unembedded chunk would be rejected by the store and take the
+                        # whole batch down with it, including the chunks that did embed.
+                        batch_records = [r for r in batch_records if r.get("embedding")]
+
+                        # Insert the batch of records
+                        insert_stmt = postgresql.insert(self.table)
+                        sess.execute(insert_stmt, batch_records)
+                        sess.commit()  # Commit batch independently
+                        log_info(f"Inserted batch of {len(batch_records)} documents.")
+                    except Exception as e:
+                        log_error(f"Error with batch starting at index {i}: {str(e)}")
+                        sess.rollback()  # Rollback the current batch if there's an error
+                        raise
+        except Exception as e:
+            log_error(f"Error inserting documents: {str(e)}")
+            raise
+
+    async def async_insert(
+        self,
+        content_hash: str,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+        batch_size: int = 100,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """Insert documents asynchronously with parallel embedding.
+
+        ``user_id`` is the owner of these chunks; ``None`` means shared. See ``insert``.
+        """
+        self._require_owner_column(user_id)
+        try:
+            with self.Session() as sess:
+                for i in range(0, len(documents), batch_size):
+                    batch_docs = documents[i : i + batch_size]
+                    log_debug(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
+                    try:
+                        # Embed all documents in the batch
+                        await self._async_embed_documents(batch_docs)
+                        # An unembedded chunk would be rejected by the store and take the
+                        # whole batch down with it, including the chunks that did embed.
+                        batch_docs = retrievable_documents(batch_docs)
+
+                        # Prepare documents for insertion
+                        batch_records = []
+                        for doc in batch_docs:
+                            try:
+                                cleaned_content = self._clean_content(doc.content)
+                                # Include content_hash in ID to ensure uniqueness across different content hashes
+                                # This allows the same URL/content to be inserted with different descriptions
+                                base_id = doc.id or md5(cleaned_content.encode()).hexdigest()
+                                record_id = self._scoped_record_id(base_id, content_hash, user_id)
+
+                                meta_data = doc.meta_data or {}
+                                if filters:
+                                    meta_data.update(filters)
+
+                                record = {
+                                    "id": record_id,
+                                    "name": doc.name,
+                                    "meta_data": meta_data,
+                                    "filters": filters,
+                                    "content": cleaned_content,
+                                    "embedding": doc.embedding,
+                                    "usage": doc.usage,
+                                    "content_hash": content_hash,
+                                    "content_id": doc.content_id,
+                                }
+                                if self._user_id_column_exists():
+                                    record["user_id"] = user_id
+                                batch_records.append(record)
+                            except Exception as e:
+                                log_error(f"Error processing document '{doc.name}': {str(e)}")
+
+                        # An unembedded chunk would be rejected by the store and take the
+                        # whole batch down with it, including the chunks that did embed.
+                        batch_records = [r for r in batch_records if r.get("embedding")]
+
+                        # Insert the batch of records
+                        if batch_records:
+                            insert_stmt = postgresql.insert(self.table)
+                            sess.execute(insert_stmt, batch_records)
+                            sess.commit()  # Commit batch independently
+                            log_info(f"Inserted batch of {len(batch_records)} documents.")
+                    except Exception as e:
+                        log_error(f"Error with batch starting at index {i}: {str(e)}")
+                        sess.rollback()  # Rollback the current batch if there's an error
+                        raise
+        except Exception as e:
+            log_error(f"Error inserting documents: {str(e)}")
+            raise
+
+    def upsert_available(self) -> bool:
+        """
+        Check if upsert operation is available.
+
+        Returns:
+            bool: Always returns True for PgVector.
+        """
+        return True
+
+    def upsert(
+        self,
+        content_hash: str,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+        batch_size: int = 100,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """
+        Upsert documents by content hash.
+        First delete all documents with the same content hash.
+        Then upsert the new documents.
+
+        ``user_id`` is the owner of these chunks; ``None`` means shared. See ``insert``.
+        """
+        # Embed before the delete below: clearing the old chunks first would destroy
+        # retrievable content if the embedder then fails.
+        for document in documents:
+            if not document.embedding:
+                document.embedding = None
+        embed_before_replace(documents, self.embedder)
+        # Empty results retain generic partial ingestion: write the usable chunks
+        # without asking the embedder again. Raised failures above still precede deletion.
+        documents = retrievable_documents(documents)
+        self._require_owner_column(user_id)
+        try:
+            if self.content_hash_exists(content_hash, user_id=user_id):
+                self._delete_by_content_hash(content_hash, user_id=user_id)
+            self._upsert(content_hash, documents, filters, batch_size, user_id=user_id)
+        except Exception as e:
+            log_error(f"Error upserting documents by content hash: {str(e)}")
+            raise
+
+    def _upsert(
+        self,
+        content_hash: str,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+        batch_size: int = 100,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """
+        Upsert (insert or update) documents in the database.
+
+        Args:
+            documents (List[Document]): List of documents to upsert.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the documents.
+            batch_size (int): Number of documents to upsert in each batch.
+            user_id (Optional[str]): Owner of these chunks. ``None`` means shared.
+        """
+        try:
+            with self.Session() as sess:
+                for i in range(0, len(documents), batch_size):
+                    batch_docs = documents[i : i + batch_size]
+                    log_info(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
+                    try:
+                        # Prepare documents for upserting
+                        batch_records_dict: Dict[str, Dict[str, Any]] = {}  # Use dict to deduplicate by ID
+                        for doc in batch_docs:
+                            try:
+                                record = self._get_document_record(doc, filters, content_hash, user_id, prepared=True)
+                                # Use the generated record ID (which includes content_hash) for deduplication
+                                batch_records_dict[record["id"]] = record
+                            except EmbeddingError:
+                                # A chunk that did not embed is unretrievable. Dropping it here
+                                # would commit the rest of the batch and report success, so the
+                                # failure is raised for ingestion to retry and record.
+                                raise
+                            except Exception as e:
+                                log_error(f"Error processing document '{doc.name}': {str(e)}")
+
+                        # Convert dict to list for upsert
+                        # An unembedded chunk would be rejected by the store and take the
+                        # whole batch down with it, including the chunks that did embed.
+                        batch_records = [r for r in batch_records_dict.values() if r.get("embedding")]
+                        if not batch_records:
+                            log_info("No valid records to upsert in this batch.")
+                            continue
+
+                        # Upsert the batch of records
+                        insert_stmt = postgresql.insert(self.table).values(batch_records)
+                        set_clause: Dict[str, Any] = {
+                            "name": insert_stmt.excluded.name,
+                            "meta_data": insert_stmt.excluded.meta_data,
+                            "filters": insert_stmt.excluded.filters,
+                            "content": insert_stmt.excluded.content,
+                            "embedding": insert_stmt.excluded.embedding,
+                            "usage": insert_stmt.excluded.usage,
+                            "content_hash": insert_stmt.excluded.content_hash,
+                            "content_id": insert_stmt.excluded.content_id,
+                            # onupdate does not fire for on_conflict_do_update, so a
+                            # re-ingested row would otherwise keep a null updated_at.
+                            "updated_at": func.now(),
+                        }
+                        if self._user_id_column_exists():
+                            # The owner is folded into the id, so a conflict is always same-owner
+                            set_clause["user_id"] = insert_stmt.excluded.user_id
+                        upsert_stmt = insert_stmt.on_conflict_do_update(
+                            index_elements=["id"],
+                            set_=set_clause,
+                        )
+                        sess.execute(upsert_stmt)
+                        sess.commit()  # Commit batch independently
+                        log_info(f"Upserted batch of {len(batch_records)} documents.")
+                    except Exception as e:
+                        log_error(f"Error with batch starting at index {i}: {str(e)}")
+                        sess.rollback()  # Rollback the current batch if there's an error
+                        raise
+        except Exception as e:
+            log_error(f"Error upserting documents: {str(e)}")
+            raise
+
+    def _scoped_record_id(self, base_id: str, content_hash: str, user_id: Optional[str]) -> str:
+        """Fold the owner into the deterministic record id so two users upserting the same content
+        get distinct primary keys. ``None`` keeps the stable base id.
+
+        ``base_id`` is collapsed into a fixed-length digest first, else the '_' boundary moves and
+        ('doc_1', 'alice') collides with ('doc', '1_alice').
+        """
+        record_id = md5(f"{base_id}_{content_hash}".encode()).hexdigest()
+        if user_id is None:
+            return record_id
+        return md5(f"{record_id}_{user_id}".encode()).hexdigest()
+
+    def _get_document_record(
+        self,
+        doc: Document,
+        filters: Optional[Dict[str, Any]] = None,
+        content_hash: str = "",
+        user_id: Optional[str] = None,
+        *,
+        prepared: bool = False,
+    ) -> Dict[str, Any]:
+        if not prepared or not doc.embedding:
+            doc.embed(embedder=self.embedder)
+        cleaned_content = self._clean_content(doc.content)
+        # Include content_hash in ID to ensure uniqueness across different content hashes
+        # This allows the same URL/content to be inserted with different descriptions
+        base_id = doc.id or md5(cleaned_content.encode()).hexdigest()
+        record_id = self._scoped_record_id(base_id, content_hash, user_id)
+
+        meta_data = doc.meta_data or {}
+        if filters:
+            meta_data.update(filters)
+
+        record = {
+            "id": record_id,
+            "name": doc.name,
+            "meta_data": meta_data,
+            "filters": filters,
+            "content": cleaned_content,
+            "embedding": doc.embedding,
+            "usage": doc.usage,
+            "content_hash": content_hash,
+            "content_id": doc.content_id,
+        }
+        # Omitted on unmigrated tables, whose INSERTs must not mention the column
+        if self._user_id_column_exists():
+            record["user_id"] = user_id
+        return record
+
+    async def _async_embed_documents(self, batch_docs: List[Document], *, prepared: bool = False) -> None:
+        """
+        Embed a batch of documents using either batch embedding or individual embedding.
+
+        Args:
+            batch_docs: List of documents to embed
+        """
+        if prepared:
+            batch_docs = [doc for doc in batch_docs if not doc.embedding]
+        if not batch_docs:
+            return
+        if self.embedder.enable_batch and hasattr(self.embedder, "async_get_embeddings_batch_and_usage"):
+            # Use batch embedding when enabled and supported
+            try:
+                # Extract content from all documents
+                doc_contents = [doc.content for doc in batch_docs]
+
+                # Get batch embeddings and usage
+                embeddings, usages = await self.embedder.async_get_embeddings_batch_and_usage(doc_contents)
+
+                # Process documents with pre-computed embeddings
+                for j, doc in enumerate(batch_docs):
+                    try:
+                        if j < len(embeddings):
+                            doc.embedding = embeddings[j]
+                            doc.usage = usages[j] if j < len(usages) else None
+                    except Exception as e:
+                        log_error(f"Error assigning batch embedding to document '{doc.name}': {str(e)}")
+
+            except Exception as e:
+                # Check if this is a rate limit error - don't fall back as it would make things worse
+                if isinstance(e, EmbeddingError):
+                    # The embedder already classified this; prefer that over matching text.
+                    is_rate_limit = e.reason == "rate_limit"
+                else:
+                    # A throttle must not fall back to per-item calls, which would throttle harder.
+                    is_rate_limit = is_rate_limit_error(e)
+
+                if is_rate_limit:
+                    log_error(f"Rate limit detected during batch embedding.: {str(e)}")
+                    raise e
+                else:
+                    log_warning(f"Async batch embedding failed, falling back to individual embeddings: {str(e)}")
+                    # Fall back to individual embedding
+                    embed_tasks = [doc.async_embed(embedder=self.embedder) for doc in batch_docs]
+                    results = await asyncio.gather(*embed_tasks, return_exceptions=True)
+                    raise_embedding_failures(results)
+        else:
+            # Use individual embedding
+            embed_tasks = [doc.async_embed(embedder=self.embedder) for doc in batch_docs]
+            results = await asyncio.gather(*embed_tasks, return_exceptions=True)
+            raise_embedding_failures(results)
+
+    async def async_upsert(
+        self,
+        content_hash: str,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+        batch_size: int = 100,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """Upsert documents asynchronously by running in a thread.
+
+        ``user_id`` is the owner of these chunks; ``None`` means shared. See ``insert``.
+        """
+        # Embed before the delete below: clearing the old chunks first would destroy
+        # retrievable content if the embedder then fails.
+        for document in documents:
+            if not document.embedding:
+                document.embedding = None
+        await aembed_before_replace(documents, self.embedder)
+        # Empty results retain generic partial ingestion: write the usable chunks
+        # without asking the embedder again. Raised failures above still precede deletion.
+        documents = retrievable_documents(documents)
+        self._require_owner_column(user_id)
+        try:
+            if self.content_hash_exists(content_hash, user_id=user_id):
+                self._delete_by_content_hash(content_hash, user_id=user_id)
+            await self._async_upsert(content_hash, documents, filters, batch_size, user_id=user_id)
+        except Exception as e:
+            log_error(f"Error upserting documents by content hash: {str(e)}")
+            raise
+
+    async def _async_upsert(
+        self,
+        content_hash: str,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+        batch_size: int = 100,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """
+        Upsert (insert or update) documents in the database.
+
+        Args:
+            documents (List[Document]): List of documents to upsert.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the documents.
+            batch_size (int): Number of documents to upsert in each batch.
+            user_id (Optional[str]): Owner of these chunks. ``None`` means shared.
+        """
+        try:
+            with self.Session() as sess:
+                for i in range(0, len(documents), batch_size):
+                    batch_docs = documents[i : i + batch_size]
+                    log_info(f"Processing batch starting at index {i}, size: {len(batch_docs)}")
+                    try:
+                        # Embed all documents in the batch
+                        await self._async_embed_documents(batch_docs, prepared=True)
+                        # An unembedded chunk would be rejected by the store and take the
+                        # whole batch down with it, including the chunks that did embed.
+                        batch_docs = retrievable_documents(batch_docs)
+
+                        # Prepare documents for upserting
+                        batch_records_dict = {}  # Use dict to deduplicate by ID
+                        for idx, doc in enumerate(batch_docs):
+                            try:
+                                cleaned_content = self._clean_content(doc.content)
+                                # Include content_hash in ID to ensure uniqueness across different content hashes
+                                # This allows the same URL/content to be inserted with different descriptions
+                                base_id = doc.id or md5(cleaned_content.encode()).hexdigest()
+                                record_id = self._scoped_record_id(base_id, content_hash, user_id)
+
+                                if (
+                                    doc.embedding is not None
+                                    and isinstance(doc.embedding, list)
+                                    and len(doc.embedding) == 0
+                                ):
+                                    log_warning(f"Document {idx} '{doc.name}' has empty embedding (length 0)")
+
+                                meta_data = doc.meta_data or {}
+                                if filters:
+                                    meta_data.update(filters)
+
+                                record = {
+                                    "id": record_id,  # use record_id as a reproducible id to avoid duplicates while upsert
+                                    "name": doc.name,
+                                    "meta_data": meta_data,
+                                    "filters": filters,
+                                    "content": cleaned_content,
+                                    "embedding": doc.embedding,
+                                    "usage": doc.usage,
+                                    "content_hash": content_hash,
+                                    "content_id": doc.content_id,
+                                }
+                                if self._user_id_column_exists():
+                                    record["user_id"] = user_id
+                                batch_records_dict[record_id] = record  # This deduplicates by ID
+                            except Exception as e:
+                                log_error(f"Error processing document '{doc.name}': {str(e)}")
+
+                        # Convert dict to list for upsert
+                        # An unembedded chunk would be rejected by the store and take the
+                        # whole batch down with it, including the chunks that did embed.
+                        batch_records = [r for r in batch_records_dict.values() if r.get("embedding")]
+                        if not batch_records:
+                            log_info("No valid records to upsert in this batch.")
+                            continue
+
+                        # Upsert the batch of records
+                        insert_stmt = postgresql.insert(self.table).values(batch_records)
+                        set_clause: Dict[str, Any] = {
+                            "name": insert_stmt.excluded.name,
+                            "meta_data": insert_stmt.excluded.meta_data,
+                            "filters": insert_stmt.excluded.filters,
+                            "content": insert_stmt.excluded.content,
+                            "embedding": insert_stmt.excluded.embedding,
+                            "usage": insert_stmt.excluded.usage,
+                            "content_hash": insert_stmt.excluded.content_hash,
+                            "content_id": insert_stmt.excluded.content_id,
+                            # onupdate does not fire for on_conflict_do_update, so a
+                            # re-ingested row would otherwise keep a null updated_at.
+                            "updated_at": func.now(),
+                        }
+                        if self._user_id_column_exists():
+                            # The owner is folded into the id, so a conflict is always same-owner
+                            set_clause["user_id"] = insert_stmt.excluded.user_id
+                        upsert_stmt = insert_stmt.on_conflict_do_update(
+                            index_elements=["id"],
+                            set_=set_clause,
+                        )
+                        sess.execute(upsert_stmt)
+                        sess.commit()  # Commit batch independently
+                        log_info(f"Upserted batch of {len(batch_records)} documents.")
+                    except Exception as e:
+                        log_error(f"Error with batch starting at index {i}: {str(e)}")
+                        sess.rollback()  # Rollback the current batch if there's an error
+                        raise
+        except Exception as e:
+            log_error(f"Error upserting documents: {str(e)}")
+            raise
+
+    def update_metadata(self, content_id: str, metadata: Dict[str, Any]) -> None:
+        """
+        Update the metadata for a document.
+
+        Args:
+            content_id (str): The ID of the document.
+            metadata (Dict[str, Any]): The metadata to update.
+        """
+        try:
+            with self.Session() as sess:
+                # Merge JSONB for metadata, but replace filters entirely (absolute value)
+                stmt = (
+                    update(self.table)
+                    .where(self.table.c.content_id == content_id)
+                    .values(
+                        meta_data=func.coalesce(self.table.c.meta_data, text("'{}'::jsonb")).op("||")(
+                            bindparam("md", type_=postgresql.JSONB)
+                        ),
+                        filters=bindparam("ft", type_=postgresql.JSONB),
+                    )
+                )
+                sess.execute(stmt, {"md": metadata, "ft": metadata})
+                sess.commit()
+        except Exception as e:
+            log_error(f"Error updating metadata for document {content_id}: {str(e)}")
+            raise
+
+    def _with_recency(self, meta_data: Optional[Dict[str, Any]], result: Any) -> Dict[str, Any]:
+        """Report the stored last-modified time, under a key of our own.
+
+        Reported only when asked for: it travels in meta_data, which reaches the model's
+        prompt, and it is namespaced so it cannot mask a timestamp the user set themselves.
+        """
+        merged = dict(meta_data) if meta_data else {}
+        if not self.return_updated_at:
+            return merged
+        timestamp = getattr(result, STORE_RECENCY_METADATA_KEY, None)
+        # A table without the columns selects NULL, so the value is not always a datetime.
+        if isinstance(timestamp, datetime):
+            merged[STORE_RECENCY_METADATA_KEY] = timestamp.isoformat()
+        return merged
+
+    def _with_scores(self, meta_data: Optional[Dict[str, Any]], result: Any) -> Dict[str, Any]:
+        """Recency plus the row's own relevance score, where the query computes one."""
+        merged = self._with_recency(meta_data, result)
+        score = getattr(result, "similarity_score", None)
+        if score is not None:
+            merged["similarity_score"] = float(score)
+        return merged
+
+    def _recency_column(self):
+        """The stored last-modified time, for rerankers that weight by recency.
+
+        updated_at is only set once a row has been re-ingested or had its metadata
+        changed, so an untouched row falls back to when it was first stored.
+        """
+        columns = self.table.c
+        # A table created before these columns existed still has to be searchable.
+        if "updated_at" in columns and "created_at" in columns:
+            return func.coalesce(columns.updated_at, columns.created_at).label(STORE_RECENCY_METADATA_KEY)
+        if "created_at" in columns:
+            return columns.created_at.label(STORE_RECENCY_METADATA_KEY)
+        return null().label(STORE_RECENCY_METADATA_KEY)
+
+    def search(
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[Union[Dict[str, Any], List[FilterExpr]]] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Document]:
+        """
+        Perform a search based on the configured search type.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Union[Dict[str, Any], List[FilterExpr]]]): Filters to apply to the search.
+            user_id (Optional[str]): Restrict results to this user's rows plus shared
+                (``user_id IS NULL``) rows. ``None`` applies no owner predicate.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        # Outside the search helpers' catch-alls so a scoped search raises instead of returning []
+        self._require_owner_column(user_id)
+        if self.search_type == SearchType.vector:
+            return self.vector_search(query=query, limit=limit, filters=filters, user_id=user_id)
+        elif self.search_type == SearchType.keyword:
+            return self.keyword_search(query=query, limit=limit, filters=filters, user_id=user_id)
+        elif self.search_type == SearchType.hybrid:
+            return self.hybrid_search(query=query, limit=limit, filters=filters, user_id=user_id)
+        else:
+            log_error(f"Invalid search type '{self.search_type}'.")
+            return []
+
+    async def async_search(
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[Union[Dict[str, Any], List[FilterExpr]]] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Document]:
+        """Search asynchronously by running in a thread."""
+        return await asyncio.to_thread(self.search, query, limit, filters, user_id)
+
+    def _dsl_to_sqlalchemy(self, filter_expr, table) -> ColumnElement[bool]:
+        op = filter_expr["op"]
+
+        if op == "EQ":
+            return table.c.meta_data[filter_expr["key"]].astext == str(filter_expr["value"])
+        elif op == "IN":
+            # Postgres JSONB array containment
+            return table.c.meta_data[filter_expr["key"]].astext.in_([str(v) for v in filter_expr["values"]])
+        elif op == "GT":
+            return table.c.meta_data[filter_expr["key"]].astext.cast(Integer) > filter_expr["value"]
+        elif op == "LT":
+            return table.c.meta_data[filter_expr["key"]].astext.cast(Integer) < filter_expr["value"]
+        elif op == "NOT":
+            return not_(self._dsl_to_sqlalchemy(filter_expr["condition"], table))
+        elif op == "AND":
+            return and_(*[self._dsl_to_sqlalchemy(cond, table) for cond in filter_expr["conditions"]])
+        elif op == "OR":
+            return or_(*[self._dsl_to_sqlalchemy(cond, table) for cond in filter_expr["conditions"]])
+        else:
+            raise ValueError(f"Unknown filter operator: {op}")
+
+    def _apply_user_scope(self, stmt, user_id: Optional[str]):
+        """AND ``user_id = X OR user_id IS NULL`` into ``stmt``. No-op when ``user_id`` is ``None``."""
+        if user_id is None:
+            return stmt
+        # Defense in depth for direct helper calls that bypass search()
+        self._require_owner_column(user_id)
+        return stmt.where(or_(self.table.c.user_id == user_id, self.table.c.user_id.is_(None)))
+
+    def vector_search(
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[Union[Dict[str, Any], List[FilterExpr]]] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Document]:
+        """
+        Perform a vector similarity search.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Union[Dict[str, Any], List[FilterExpr]]]): Filters to apply to the search.
+            user_id (Optional[str]): Restrict results to this user's rows plus shared rows.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        try:
+            # Get the embedding for the query string
+            query_embedding = self.embedder.get_embedding(query)
+            if query_embedding is None:
+                log_error(f"Error getting embedding for Query: {query}")
+                return []
+
+            if self.distance == Distance.l2:
+                distance_expr = self.table.c.embedding.l2_distance(query_embedding)
+            elif self.distance == Distance.cosine:
+                distance_expr = self.table.c.embedding.cosine_distance(query_embedding)
+            elif self.distance == Distance.max_inner_product:
+                distance_expr = self.table.c.embedding.max_inner_product(query_embedding)
+            else:
+                log_error(f"Unknown distance metric: {self.distance}")
+                return []
+
+            columns = [
+                self.table.c.id,
+                self.table.c.name,
+                self.table.c.meta_data,
+                self.table.c.content,
+                self.table.c.embedding,
+                self.table.c.usage,
+                self._recency_column(),
+                distance_expr.label("distance"),
+            ]
+
+            # Build the base statement
+            stmt = select(*columns)
+
+            # Apply the user scope first so the planner narrows on the user_id index before the ANN scan
+            stmt = self._apply_user_scope(stmt, user_id)
+
+            # Apply filters if provided
+            if filters is not None:
+                # Handle dict filters
+                if isinstance(filters, dict):
+                    stmt = stmt.where(self.table.c.meta_data.contains(filters))
+                # Handle FilterExpr DSL
+                else:
+                    # Convert each DSL expression to SQLAlchemy and AND them together
+                    sqlalchemy_conditions = [
+                        self._dsl_to_sqlalchemy(f.to_dict() if hasattr(f, "to_dict") else f, self.table)
+                        for f in filters
+                    ]
+                    stmt = stmt.where(and_(*sqlalchemy_conditions))
+
+            # Apply similarity threshold filter
+            if self.similarity_threshold is not None:
+                distance_threshold = score_to_distance_threshold(self.similarity_threshold, self.distance)
+                if self.distance == Distance.max_inner_product:
+                    # For inner product, negate threshold since pgvector returns negative values
+                    stmt = stmt.where(distance_expr <= -distance_threshold)
+                else:
+                    # For cosine and L2, smaller distances mean higher similarity
+                    stmt = stmt.where(distance_expr <= distance_threshold)
+
+            stmt = stmt.order_by(distance_expr)
+
+            # Limit the number of results
+            stmt = stmt.limit(limit)
+
+            # Log the query for debugging
+            log_debug(f"Vector search query: {stmt}")
+
+            # Execute the query
+            try:
+                with self.Session() as sess, sess.begin():
+                    if self.vector_index is not None:
+                        if isinstance(self.vector_index, Ivfflat):
+                            sess.execute(text(f"SET LOCAL ivfflat.probes = {self.vector_index.probes}"))
+                        elif isinstance(self.vector_index, HNSW):
+                            sess.execute(text(f"SET LOCAL hnsw.ef_search = {self.vector_index.ef_search}"))
+                    results = sess.execute(stmt).fetchall()
+            except Exception as e:
+                log_error(f"Error performing semantic search: {str(e)}")
+                log_error(f"Table might not exist, creating for future use: {str(e)}")
+                self.create()
+                return []
+
+            search_results: List[Document] = []
+            for result in results:
+                # For inner product, negate since pgvector returns negative values
+                raw_distance = -result.distance if self.distance == Distance.max_inner_product else result.distance
+                similarity_score = normalize_score(raw_distance, self.distance)
+                meta_data = self._with_recency(result.meta_data, result)
+                meta_data["similarity_score"] = similarity_score
+
+                search_results.append(
+                    Document(
+                        id=result.id,
+                        name=result.name,
+                        meta_data=meta_data,
+                        content=result.content,
+                        embedder=self.embedder,
+                        embedding=result.embedding,
+                        usage=result.usage,
+                    )
+                )
+
+            if self.reranker:
+                search_results = self.reranker.rerank(query=query, documents=search_results)
+
+            log_info(f"Found {len(search_results)} documents")
+            return search_results
+        except EmbeddingError:
+            # A failed query embedding is not a store problem: let it surface instead
+            # of returning an empty result set that looks like "no matches".
+            raise
+        except Exception as e:
+            log_error(f"Error during vector search: {str(e)}")
+            return []
+
+    def _build_ts_query(self, query: str):
+        """
+        Build the tsquery expression for keyword / hybrid search.
+
+        When ``prefix_match`` is False (default) we use
+        ``websearch_to_tsquery``, which accepts free-form natural language
+        and supports AND/OR/quoted-phrases/-negation. When ``prefix_match``
+        is True we tokenize on word boundaries and build a ``to_tsquery``
+        expression with ``:*`` per token — that lets a partial query like
+        ``"ani"`` match the ``anim`` lexeme that ``"animal"`` lemmatizes
+        into.
+
+        Returns ``None`` for a query that doesn't yield any usable tokens
+        in prefix mode (caller should treat as "no FTS hit").
+        """
+        if not self.prefix_match:
+            return func.websearch_to_tsquery(self.content_language, bindparam("query", value=query))
+
+        # to_tsquery is stricter than websearch_to_tsquery: it doesn't
+        # tolerate punctuation or operators in the input. Tokenize on
+        # word boundaries, append :* per token, AND them.
+        tokens = re.findall(r"\w+", query)
+        if not tokens:
+            return None
+        prefix_query = " & ".join(f"{t}:*" for t in tokens)
+        return func.to_tsquery(self.content_language, bindparam("query", value=prefix_query))
+
+    def keyword_search(
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[Union[Dict[str, Any], List[FilterExpr]]] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Document]:
+        """
+        Perform a keyword search on the 'content' column.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Union[Dict[str, Any], List[FilterExpr]]]): Filters to apply to the search.
+            user_id (Optional[str]): Restrict results to this user's rows plus shared rows.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        try:
+            # Define the columns to select
+            columns = [
+                self.table.c.id,
+                self.table.c.name,
+                self.table.c.meta_data,
+                self.table.c.content,
+                self.table.c.embedding,
+                self.table.c.usage,
+                self._recency_column(),
+            ]
+
+            # Build the base statement
+            stmt = select(*columns)
+
+            # Apply the user scope first so the planner narrows before the full-text scan
+            stmt = self._apply_user_scope(stmt, user_id)
+
+            # Build the text search vector
+            ts_vector = func.to_tsvector(self.content_language, self.table.c.content)
+            # Build the ts_query — routes through to_tsquery with :* per token
+            # when prefix_match is on, websearch_to_tsquery otherwise.
+            ts_query = self._build_ts_query(query)
+            if ts_query is None:
+                # Prefix mode with no usable tokens (e.g. empty query): nothing to match
+                return []
+            # Compute the text rank
+            text_rank = func.ts_rank_cd(ts_vector, ts_query)
+
+            # Apply filters if provided
+            if filters is not None:
+                # Handle dict filters
+                if isinstance(filters, dict):
+                    stmt = stmt.where(self.table.c.meta_data.contains(filters))
+                # Handle FilterExpr DSL
+                else:
+                    # Convert each DSL expression to SQLAlchemy and AND them together
+                    sqlalchemy_conditions = [
+                        self._dsl_to_sqlalchemy(f.to_dict() if hasattr(f, "to_dict") else f, self.table)
+                        for f in filters
+                    ]
+                    stmt = stmt.where(and_(*sqlalchemy_conditions))
+
+            # Surface the rank too, so a reranker that blends in another signal has a
+            # relevance score to blend with rather than treating every row as 0. Reported
+            # on the same 0-1 scale as the other search types, since ts_rank_cd itself
+            # returns small unbounded values that would barely register in a blend.
+            stmt = stmt.add_columns(_normalized_rank(text_rank).label("similarity_score"))
+
+            # Order by the relevance rank
+            stmt = stmt.order_by(text_rank.desc())
+
+            # Limit the number of results
+            stmt = stmt.limit(limit)
+
+            # Log the query for debugging
+            log_debug(f"Keyword search query: {stmt}")
+
+            # Execute the query
+            try:
+                with self.Session() as sess, sess.begin():
+                    results = sess.execute(stmt).fetchall()
+            except Exception as e:
+                log_error(f"Error performing keyword search: {str(e)}")
+                log_error(f"Table might not exist, creating for future use: {str(e)}")
+                self.create()
+                return []
+
+            # Process the results and convert to Document objects
+            search_results: List[Document] = []
+            for result in results:
+                search_results.append(
+                    Document(
+                        id=result.id,
+                        name=result.name,
+                        meta_data=self._with_scores(result.meta_data, result),
+                        content=result.content,
+                        embedder=self.embedder,
+                        embedding=result.embedding,
+                        usage=result.usage,
+                    )
+                )
+
+            log_info(f"Found {len(search_results)} documents")
+            return search_results
+        except Exception as e:
+            log_error(f"Error during keyword search: {str(e)}")
+            return []
+
+    def hybrid_search(
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[Union[Dict[str, Any], List[FilterExpr]]] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Document]:
+        """
+        Perform a hybrid search combining vector similarity and full-text search.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Union[Dict[str, Any], List[FilterExpr]]]): Filters to apply to the search.
+            user_id (Optional[str]): Restrict results to this user's rows plus shared rows.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+        try:
+            # Get the embedding for the query string
+            query_embedding = self.embedder.get_embedding(query)
+            if query_embedding is None:
+                log_error(f"Error getting embedding for Query: {query}")
+                return []
+
+            # Define the columns to select
+            columns = [
+                self.table.c.id,
+                self.table.c.name,
+                self.table.c.meta_data,
+                self.table.c.content,
+                self.table.c.embedding,
+                self.table.c.usage,
+                self._recency_column(),
+            ]
+
+            # === TEXT SEARCH COMPONENT ===
+            # Hybrid search combines: (1) text/keyword matching + (2) vector similarity
+
+            # ts_vector: convert document content into searchable tokens
+            # Example: "The quick fox" -> 'fox':3 'quick':2 (stems words, removes stopwords)
+            ts_vector = func.to_tsvector(self.content_language, self.table.c.content)
+
+            # ts_query: convert user's search query into a search pattern
+            # Routes through to_tsquery with :* per token when prefix_match is on,
+            # websearch_to_tsquery otherwise
+            ts_query = self._build_ts_query(query)
+            if ts_query is None:
+                # No usable tokens (e.g. query was "!@#$" or empty)
+                # Fall back to empty tsquery so text_rank=0, letting vector search drive results
+                ts_query = literal_column("''::tsquery")
+
+            # text_rank: score how well document matches the query (0.0 to 1.0)
+            # ts_rank_cd returns small values (0.0-0.1), normalize with x/(x+k) formula
+            raw_text_rank = func.ts_rank_cd(ts_vector, ts_query)
+            text_rank = _normalized_rank(raw_text_rank)
+
+            # Compute the vector similarity score
+            if self.distance == Distance.l2:
+                # For L2 distance, smaller distances are better
+                vector_distance = self.table.c.embedding.l2_distance(query_embedding)
+                # Invert and normalize the distance to get a similarity score between 0 and 1
+                vector_score = 1 / (1 + vector_distance)
+            elif self.distance == Distance.cosine:
+                # For cosine distance, smaller distances are better
+                vector_distance = self.table.c.embedding.cosine_distance(query_embedding)
+                # Convert distance to similarity (cosine_distance = 1 - cosine_similarity)
+                vector_score = func.greatest(0.0, 1 - vector_distance)
+            elif self.distance == Distance.max_inner_product:
+                # For inner product, higher values are better
+                # pgvector returns negative inner product, so negate to get actual value
+                negative_ip = self.table.c.embedding.max_inner_product(query_embedding)
+                inner_product = -negative_ip
+                # Normalize to range [0, 1]
+                vector_score = func.greatest(0.0, func.least(1.0, (inner_product + 1) / 2))
+            else:
+                log_error(f"Unknown distance metric: {self.distance}")
+                return []
+
+            # Apply weights to control the influence of each score
+            # Validate the vector_weight parameter
+            if not 0 <= self.vector_score_weight <= 1:
+                raise ValueError("vector_score_weight must be between 0 and 1")
+            text_rank_weight = 1 - self.vector_score_weight  # weight for text rank
+
+            # Combine the scores into a hybrid score
+            hybrid_score = (self.vector_score_weight * vector_score) + (text_rank_weight * text_rank)
+
+            # Build the base statement, including the hybrid score
+            stmt = select(*columns, hybrid_score.label("hybrid_score"))
+
+            # Apply the user scope first so the planner narrows before scoring
+            stmt = self._apply_user_scope(stmt, user_id)
+
+            # Add the full-text search condition
+            # stmt = stmt.where(ts_vector.op("@@")(ts_query))
+
+            # Apply filters if provided
+            if filters is not None:
+                # Handle dict filters
+                if isinstance(filters, dict):
+                    stmt = stmt.where(self.table.c.meta_data.contains(filters))
+                # Handle FilterExpr DSL
+                else:
+                    # Convert each DSL expression to SQLAlchemy and AND them together
+                    sqlalchemy_conditions = [
+                        self._dsl_to_sqlalchemy(f.to_dict() if hasattr(f, "to_dict") else f, self.table)
+                        for f in filters
+                    ]
+                    stmt = stmt.where(and_(*sqlalchemy_conditions))
+
+            if self.similarity_threshold is not None:
+                stmt = stmt.where(hybrid_score >= self.similarity_threshold)
+
+            # Order the results by the hybrid score in descending order
+            stmt = stmt.order_by(desc("hybrid_score"))
+
+            # Limit the number of results
+            stmt = stmt.limit(limit)
+
+            # Log the query for debugging
+            log_debug(f"Hybrid search query: {stmt}")
+
+            # Execute the query
+            try:
+                with self.Session() as sess, sess.begin():
+                    if self.vector_index is not None:
+                        if isinstance(self.vector_index, Ivfflat):
+                            sess.execute(text(f"SET LOCAL ivfflat.probes = {self.vector_index.probes}"))
+                        elif isinstance(self.vector_index, HNSW):
+                            sess.execute(text(f"SET LOCAL hnsw.ef_search = {self.vector_index.ef_search}"))
+                    results = sess.execute(stmt).fetchall()
+            except Exception as e:
+                log_error(f"Error performing hybrid search: {str(e)}")
+                return []
+
+            search_results: List[Document] = []
+            for result in results:
+                meta_data = self._with_recency(result.meta_data, result)
+                meta_data["similarity_score"] = float(result.hybrid_score)
+
+                search_results.append(
+                    Document(
+                        id=result.id,
+                        name=result.name,
+                        meta_data=meta_data,
+                        content=result.content,
+                        embedder=self.embedder,
+                        embedding=result.embedding,
+                        usage=result.usage,
+                    )
+                )
+
+            if self.reranker:
+                search_results = self.reranker.rerank(query=query, documents=search_results)
+
+            log_info(f"Found {len(search_results)} documents")
+
+            return search_results
+        except EmbeddingError:
+            # A failed query embedding is not a store problem: let it surface instead
+            # of returning an empty result set that looks like "no matches".
+            raise
+        except Exception as e:
+            log_error(f"Error during hybrid search: {str(e)}")
+            return []
+
+    def drop(self) -> None:
+        """
+        Drop the table from the database.
+        """
+        if self.table_exists():
+            try:
+                log_debug(f"Dropping table '{self.table.fullname}'.")
+                self.table.drop(self.db_engine)
+                log_info(f"Table '{self.table.fullname}' dropped successfully.")
+                # The next table under this name will have the owner column — re-resolve lazily
+                self._owner_column_exists = None
+            except Exception as e:
+                log_error(f"Error dropping table '{self.table.fullname}': {str(e)}")
+                raise
+        else:
+            log_info(f"Table '{self.table.fullname}' does not exist.")
+
+    async def async_drop(self) -> None:
+        """Drop the table asynchronously by running in a thread."""
+        await asyncio.to_thread(self.drop)
+
+    def exists(self) -> bool:
+        """
+        Check if the table exists in the database.
+
+        Returns:
+            bool: True if the table exists, False otherwise.
+        """
+        return self.table_exists()
+
+    async def async_exists(self) -> bool:
+        """Check if table exists asynchronously by running in a thread."""
+        return await asyncio.to_thread(self.exists)
+
+    def get_count(self) -> int:
+        """
+        Get the number of records in the table.
+
+        Returns:
+            int: The number of records in the table.
+        """
+        try:
+            with self.Session() as sess, sess.begin():
+                stmt = select(func.count(self.table.c.name)).select_from(self.table)
+                result = sess.execute(stmt).scalar()
+                return int(result) if result is not None else 0
+        except Exception as e:
+            log_error(f"Error getting count from table '{self.table.fullname}': {str(e)}")
+            return 0
+
+    def optimize(self, force_recreate: bool = False) -> None:
+        """
+        Optimize the vector database by creating or recreating necessary indexes.
+
+        Args:
+            force_recreate (bool): If True, existing indexes will be dropped and recreated.
+        """
+        log_debug("==== Optimizing Vector DB ====")
+        self._create_vector_index(force_recreate=force_recreate)
+        self._create_gin_index(force_recreate=force_recreate)
+        log_debug("==== Optimized Vector DB ====")
+
+    def _index_exists(self, index_name: str) -> bool:
+        """
+        Check if an index with the given name exists.
+
+        Args:
+            index_name (str): The name of the index to check.
+
+        Returns:
+            bool: True if the index exists, False otherwise.
+        """
+        inspector = inspect(self.db_engine)
+        indexes = inspector.get_indexes(self.table.name, schema=self.schema)
+        return any(idx["name"] == index_name for idx in indexes)
+
+    def _drop_index(self, index_name: str) -> None:
+        """
+        Drop the index with the given name.
+
+        Args:
+            index_name (str): The name of the index to drop.
+        """
+        try:
+            with self.Session() as sess, sess.begin():
+                drop_index_sql = f'DROP INDEX IF EXISTS "{self.schema}"."{index_name}";'
+                sess.execute(text(drop_index_sql))
+        except Exception as e:
+            log_error(f"Error dropping index '{index_name}': {str(e)}")
+            raise
+
+    def _create_vector_index(self, force_recreate: bool = False) -> None:
+        """
+        Create or recreate the vector index.
+
+        Args:
+            force_recreate (bool): If True, existing index will be dropped and recreated.
+        """
+        if self.vector_index is None:
+            log_debug("No vector index specified, skipping vector index optimization.")
+            return
+
+        # Generate index name if not provided
+        if self.vector_index.name is None:
+            index_type = "ivfflat" if isinstance(self.vector_index, Ivfflat) else "hnsw"
+            self.vector_index.name = f"{self.table_name}_{index_type}_index"
+
+        # Determine index distance operator
+        index_distance = {
+            Distance.l2: "vector_l2_ops",
+            Distance.max_inner_product: "vector_ip_ops",
+            Distance.cosine: "vector_cosine_ops",
+        }.get(self.distance, "vector_cosine_ops")
+
+        # Get the fully qualified table name
+        table_fullname = self.table.fullname  # includes schema if any
+
+        # Check if vector index already exists
+        vector_index_exists = self._index_exists(self.vector_index.name)
+
+        if vector_index_exists:
+            log_info(f"Vector index '{self.vector_index.name}' already exists.")
+            if force_recreate:
+                log_info(f"Force recreating vector index '{self.vector_index.name}'. Dropping existing index.")
+                self._drop_index(self.vector_index.name)
+            else:
+                log_info(f"Skipping vector index creation as index '{self.vector_index.name}' already exists.")
+                return
+
+        # Proceed to create the vector index
+        try:
+            with self.Session() as sess, sess.begin():
+                # Set configuration parameters
+                if self.vector_index.configuration:
+                    log_debug(f"Setting configuration: {self.vector_index.configuration}")
+                    for key, value in self.vector_index.configuration.items():
+                        sess.execute(text(f"SET {key} = :value;"), {"value": value})
+
+                if isinstance(self.vector_index, Ivfflat):
+                    self._create_ivfflat_index(sess, table_fullname, index_distance)
+                elif isinstance(self.vector_index, HNSW):
+                    self._create_hnsw_index(sess, table_fullname, index_distance)
+                else:
+                    log_error(f"Unknown index type: {type(self.vector_index)}")
+                    return
+        except Exception as e:
+            log_error(f"Error creating vector index '{self.vector_index.name}': {str(e)}")
+            raise
+
+    def _create_ivfflat_index(self, sess: Session, table_fullname: str, index_distance: str) -> None:
+        """
+        Create an IVFFlat index.
+
+        Args:
+            sess (Session): SQLAlchemy session.
+            table_fullname (str): Fully qualified table name.
+            index_distance (str): Distance metric for the index.
+        """
+        # Cast index to Ivfflat for type hinting
+        self.vector_index = cast(Ivfflat, self.vector_index)
+
+        # Determine number of lists
+        num_lists = self.vector_index.lists
+        if self.vector_index.dynamic_lists:
+            total_records = self.get_count()
+            log_debug(f"Number of records: {total_records}")
+            if total_records < 1000000:
+                num_lists = max(int(total_records / 1000), 1)  # Ensure at least one list
+            else:
+                num_lists = max(int(sqrt(total_records)), 1)
+
+        # Set ivfflat.probes
+        sess.execute(text("SET ivfflat.probes = :probes;"), {"probes": self.vector_index.probes})
+
+        log_debug(
+            f"Creating Ivfflat index '{self.vector_index.name}' on table '{table_fullname}' with "
+            f"lists: {num_lists}, probes: {self.vector_index.probes}, "
+            f"and distance metric: {index_distance}"
+        )
+
+        # Create index
+        create_index_sql = text(
+            f'CREATE INDEX "{self.vector_index.name}" ON {table_fullname} '
+            f"USING ivfflat (embedding {index_distance}) "
+            f"WITH (lists = :num_lists);"
+        )
+        sess.execute(create_index_sql, {"num_lists": num_lists})
+
+    def _create_hnsw_index(self, sess: Session, table_fullname: str, index_distance: str) -> None:
+        """
+        Create an HNSW index.
+
+        Args:
+            sess (Session): SQLAlchemy session.
+            table_fullname (str): Fully qualified table name.
+            index_distance (str): Distance metric for the index.
+        """
+        # Cast index to HNSW for type hinting
+        self.vector_index = cast(HNSW, self.vector_index)
+
+        log_debug(
+            f"Creating HNSW index '{self.vector_index.name}' on table '{table_fullname}' with "
+            f"m: {self.vector_index.m}, ef_construction: {self.vector_index.ef_construction}, "
+            f"and distance metric: {index_distance}"
+        )
+
+        # Create index
+        create_index_sql = text(
+            f'CREATE INDEX "{self.vector_index.name}" ON {table_fullname} '
+            f"USING hnsw (embedding {index_distance}) "
+            f"WITH (m = :m, ef_construction = :ef_construction);"
+        )
+        sess.execute(create_index_sql, {"m": self.vector_index.m, "ef_construction": self.vector_index.ef_construction})
+
+    def _create_gin_index(self, force_recreate: bool = False) -> None:
+        """
+        Create or recreate the GIN index for full-text search.
+
+        Args:
+            force_recreate (bool): If True, existing index will be dropped and recreated.
+        """
+        gin_index_name = f"{self.table_name}_content_gin_index"
+
+        gin_index_exists = self._index_exists(gin_index_name)
+
+        if gin_index_exists:
+            log_info(f"GIN index '{gin_index_name}' already exists.")
+            if force_recreate:
+                log_info(f"Force recreating GIN index '{gin_index_name}'. Dropping existing index.")
+                self._drop_index(gin_index_name)
+            else:
+                log_info(f"Skipping GIN index creation as index '{gin_index_name}' already exists.")
+                return
+
+        # Proceed to create GIN index
+        try:
+            with self.Session() as sess, sess.begin():
+                log_debug(f"Creating GIN index '{gin_index_name}' on table '{self.table.fullname}'.")
+                # Create index
+                create_gin_index_sql = text(
+                    f'CREATE INDEX "{gin_index_name}" ON {self.table.fullname} '
+                    f"USING GIN (to_tsvector({self.content_language}, content));"
+                )
+                sess.execute(create_gin_index_sql)
+        except Exception as e:
+            log_error(f"Error creating GIN index '{gin_index_name}': {str(e)}")
+            raise
+
+    def delete(self) -> bool:
+        """
+        Delete all records from the table.
+
+        Returns:
+            bool: True if deletion was successful, False otherwise.
+        """
+        from sqlalchemy import delete
+
+        try:
+            with self.Session() as sess:
+                sess.execute(delete(self.table))
+                sess.commit()
+                log_info(f"Deleted all records from table '{self.table.fullname}'.")
+                return True
+        except Exception as e:
+            log_error(f"Error deleting rows from table '{self.table.fullname}': {str(e)}")
+            sess.rollback()
+            return False
+
+    def delete_by_id(self, id: str) -> bool:
+        """
+        Delete content by ID.
+        """
+        try:
+            with self.Session() as sess, sess.begin():
+                stmt = self.table.delete().where(self.table.c.id == id)
+                sess.execute(stmt)
+                sess.commit()
+                log_info(f"Deleted records with id '{id}' from table '{self.table.fullname}'.")
+                return True
+        except Exception as e:
+            log_error(f"Error deleting rows from table '{self.table.fullname}': {str(e)}")
+            sess.rollback()
+            return False
+
+    def delete_by_name(self, name: str) -> bool:
+        """
+        Delete content by name.
+        """
+        try:
+            with self.Session() as sess, sess.begin():
+                stmt = self.table.delete().where(self.table.c.name == name)
+                sess.execute(stmt)
+                sess.commit()
+                log_info(f"Deleted records with name '{name}' from table '{self.table.fullname}'.")
+                return True
+        except Exception as e:
+            log_error(f"Error deleting rows from table '{self.table.fullname}': {str(e)}")
+            sess.rollback()
+            return False
+
+    def delete_by_metadata(self, metadata: Dict[str, Any]) -> bool:
+        """
+        Delete content by metadata.
+        """
+        try:
+            with self.Session() as sess, sess.begin():
+                stmt = self.table.delete().where(self.table.c.meta_data.contains(metadata))
+                sess.execute(stmt)
+                sess.commit()
+                log_info(f"Deleted records with metadata '{metadata}' from table '{self.table.fullname}'.")
+                return True
+        except Exception as e:
+            log_error(f"Error deleting rows from table '{self.table.fullname}': {str(e)}")
+            sess.rollback()
+            return False
+
+    def delete_by_content_id(self, content_id: str, user_id: Optional[str] = None) -> bool:
+        """
+        Delete content by content ID, scoped to ``user_id`` when set.
+
+        Without ``user_id`` the delete spans every owner, so it is for unscoped/admin callers only.
+        """
+        # Outside the try so a scoped delete raises instead of returning False
+        self._require_owner_column(user_id)
+        try:
+            with self.Session() as sess, sess.begin():
+                stmt = self.table.delete().where(self.table.c.content_id == content_id)
+                if user_id is not None:
+                    stmt = stmt.where(self.table.c.user_id == user_id)
+                sess.execute(stmt)
+                sess.commit()
+                log_info(f"Deleted records with content ID '{content_id}' from table '{self.table.fullname}'.")
+                return True
+        except Exception as e:
+            log_error(f"Error deleting rows from table '{self.table.fullname}': {str(e)}")
+            sess.rollback()
+            return False
+
+    def _delete_by_content_hash(self, content_hash: str, user_id: Optional[str] = None) -> bool:
+        """
+        Delete content by content hash, scoped to ``user_id`` when set.
+
+        Args:
+            content_hash (str): The content hash to delete.
+            user_id (Optional[str]): Owner to scope the delete to. None scopes to the shared
+                bucket (``user_id IS NULL``) so a shared re-upsert never wipes an owner's rows.
+        """
+        # Every row on an unmigrated table is unowned, so the shared bucket is the whole table.
+        # Outside the try so a scoped delete raises instead of returning False
+        scope_to_owner = self._require_owner_column(user_id)
+        try:
+            with self.Session() as sess, sess.begin():
+                stmt = self.table.delete().where(self.table.c.content_hash == content_hash)
+                if scope_to_owner:
+                    if user_id is not None:
+                        stmt = stmt.where(self.table.c.user_id == user_id)
+                    else:
+                        stmt = stmt.where(self.table.c.user_id.is_(None))
+                sess.execute(stmt)
+                sess.commit()
+                log_info(f"Deleted records with content hash '{content_hash}' from table '{self.table.fullname}'.")
+                return True
+        except Exception as e:
+            log_error(f"Error deleting rows from table '{self.table.fullname}': {str(e)}")
+            sess.rollback()
+            return False
+
+    def __deepcopy__(self, memo):
+        """
+        Create a deep copy of the PgVector instance, handling unpickleable attributes.
+
+        Args:
+            memo (dict): A dictionary of objects already copied during the current copying pass.
+
+        Returns:
+            PgVector: A deep-copied instance of PgVector.
+        """
+        from copy import deepcopy
+
+        # Create a new instance without calling __init__
+        cls = self.__class__
+        copied_obj = cls.__new__(cls)
+        memo[id(self)] = copied_obj
+
+        # Deep copy attributes
+        for k, v in self.__dict__.items():
+            if k in {"metadata", "table"}:
+                continue
+            # Reuse db_engine and Session without copying
+            elif k in {"db_engine", "Session", "embedder"}:
+                setattr(copied_obj, k, v)
+            else:
+                setattr(copied_obj, k, deepcopy(v, memo))
+
+        # Recreate metadata and table for the copied instance
+        copied_obj.metadata = MetaData(schema=copied_obj.schema)
+        copied_obj.table = copied_obj.get_table()
+
+        return copied_obj
+
+    def get_supported_search_types(self) -> List[str]:
+        return [SearchType.vector, SearchType.keyword, SearchType.hybrid]
