@@ -593,10 +593,10 @@ Update this table whenever a framework is added, removed, or a minimum version c
 
 | Framework | Min version tested | Docs source | MCP URL | Key note |
 |---|---|---|---|---|
-| Agno | 2.9.0 | MCP + llms-full.txt | `https://docs.agno.com/mcp` | Use `Claude(id=...)` for Anthropic models; Agno 3.0 renamed some toolkit/memory params but `SqliteDb` + `add_history_to_context` are unchanged (see its v2→v3 migration guide) |
+| Agno | 3.1.8 | MCP + llms-full.txt | `https://docs.agno.com/mcp` | Use `Claude(id=...)` for Anthropic models; Agno 3.0 renamed some toolkit/memory params but `SqliteDb` + `add_history_to_context` are unchanged (see its v2→v3 migration guide) |
 | CrewAI | 1.15.17 | MCP + llms.txt | `https://docs.crewai.com/mcp` | `crewai create crew <slug>` to scaffold |
-| LangGraph | 1.2.11 | MCP + llms.txt | `https://docs.langchain.com/mcp` | `create_react_agent` moved to `langchain.agents.create_agent` (V1.0+); requires `LANGSMITH_API_KEY` for tracing |
-| Google ADK | 2.9.1 | Context7 (`/google/adk-python`) + WebFetch llms.txt | `https://mcp.context7.com/mcp` (general-purpose, no ADK-dedicated server exists) | `root_agent` must be defined in `agent.py`; ADK 1.0+ also supports the A2A (Agent2Agent) protocol natively for cross-framework agent-to-agent calls |
+| LangGraph | 1.2.16 | MCP + llms.txt | `https://docs.langchain.com/mcp` | `create_react_agent` moved to `langchain.agents.create_agent` (V1.0+); requires `LANGSMITH_API_KEY` for tracing |
+| Google ADK | 2.12.0 | Context7 (`/google/adk-python`) + WebFetch llms.txt | `https://mcp.context7.com/mcp` (general-purpose, no ADK-dedicated server exists) | `root_agent` must be defined in `agent.py`; ADK 1.0+ also supports the A2A (Agent2Agent) protocol natively for cross-framework agent-to-agent calls |
 
 **Frameworks evaluated and intentionally not included:** AutoGen (its upstream project is in maintenance mode after merging into Microsoft Agent Framework 1.0 — see the community fork AG2 if you specifically need that lineage) and smolagents / Pydantic AI (real adoption for small, single-file agents, but not yet at the multi-file scaffold parity this repo's skills assume). Re-evaluate against "Adding a New Framework" above if adoption data changes.
 
