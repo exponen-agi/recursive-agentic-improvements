@@ -122,7 +122,7 @@ Ensure you set:
 - `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` / `GOOGLE_API_KEY`)
 
 ### Step 3: Set Up MCP Documentation Servers (Highly Recommended)
-To allow Claude Code to inspect the latest framework documentation live, add the MCP servers to your global config (`~/.claude/settings.json`) or project config (`.claude/settings.json`):
+To allow Claude Code to inspect the latest framework documentation live, add the MCP servers to your global config (`~/.claude/settings.json` on macOS/Linux, `%USERPROFILE%\.claude\settings.json` on Windows) or project config (`.claude/settings.json`):
 
 ```json
 {
