@@ -10,10 +10,18 @@ updates:
     schedule:
       interval: weekly
   - package-ecosystem: uv
-    directories:
-      - /tests/agno
-      - /tests/crewai
-      - /tests/langgraph
-      - /tests/google_adk
+    directory: /tests/agno
+    schedule:
+      interval: weekly
+  - package-ecosystem: uv
+    directory: /tests/crewai
+    schedule:
+      interval: weekly
+  - package-ecosystem: uv
+    directory: /tests/langgraph
+    schedule:
+      interval: weekly
+  - package-ecosystem: uv
+    directory: /tests/google_adk
     schedule:
       interval: weekly
