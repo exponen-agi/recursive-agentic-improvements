@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Showcase and testing suite for Agno"
 requires-python = ">=3.11"
 dependencies = [
-    "agno==3.1.8",
+    "agno==3.1.10",
     "openai",
     "sqlalchemy",
     "pytest",
