@@ -124,7 +124,7 @@ An interactive version is on the [landing page](https://cloudbloqavi.github.io/r
 | Framework | Min version tested | Docs source | MCP URL | Key note |
 |---|---|---|---|---|
 | Agno | 2.9.0 | MCP + llms-full.txt | `https://docs.agno.com/mcp` | Use `Claude(id=...)` for Anthropic models; memory uses `SqliteDb` + `add_history_to_context=True` |
-| CrewAI | 1.15.17 | MCP + llms.txt | `https://docs.crewai.com/mcp` | `crewai create crew <slug>` to scaffold |
+| CrewAI | 1.15.28 | MCP + llms.txt | `https://docs.crewai.com/mcp` | `crewai create crew <slug>` to scaffold |
 | LangGraph | 1.2.11 | MCP + llms.txt | `https://docs.langchain.com/mcp` | `create_react_agent` moved to `langchain.agents.create_agent` (V1.0+); tracing needs `LANGSMITH_API_KEY` |
 | Google ADK | 2.9.1 | Context7 (`/google/adk-python`) + WebFetch llms.txt | `https://mcp.context7.com/mcp` | `root_agent` must be defined in `agent.py`; no ADK-dedicated MCP server exists, so general-purpose Context7 is used |
 
