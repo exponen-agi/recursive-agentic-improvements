@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Showcase and testing suite for CrewAI"
 requires-python = ">=3.11"
 dependencies = [
-    "crewai==1.15.28",
+    "crewai==1.15.30",
     "langchain-openai",
     "pytest",
 ]
