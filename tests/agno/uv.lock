@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
@@ -8,7 +8,7 @@ resolution-markers = [
 
 [[package]]
 name = "agno"
-version = "3.1.10"
+version = "3.1.12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "agnoctl" },
@@ -22,9 +22,9 @@ dependencies = [
     { name = "rich" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ad/f7/002d37fab96dff126b56879578e745d6ceb2a99834342415c4ec5d9c1016/agno-3.1.10.tar.gz", hash = "sha256:1830567bd35ea0a178a5c213d6a93dde84d21caae147e4dd285351c3686a41c8", size = 4108774, upload-time = "2026-10-23T13:11:25.529Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/43/41/9a94e51250e642e92da2a4c11dc932de16cb9caf87919723d42448794620/agno-3.1.12.tar.gz", hash = "sha256:e3425e04cbfff850d9cd482d4247a149fdfb362fe906de7b58a84370c2989c3f", size = 4155683, upload-time = "2026-10-29T14:01:53.626Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1c/38/0ca8cd1d0f29ee850566ebb15f4d4fdb4a2c78fc958903bcec398eaf9ba7/agno-3.1.10-py3-none-any.whl", hash = "sha256:ea1d0d2f8f7e8d0c413c2a1df57b4c784dac2f70ceac1f69b935fd8d2ef68c7e", size = 4657166, upload-time = "2026-10-23T13:11:21.745Z" },
+    { url = "https://files.pythonhosted.org/packages/75/71/00fe070e9b81fad092ac7813e6c59c6912ec932c57f50ef73ad0bec31e4e/agno-3.1.12-py3-none-any.whl", hash = "sha256:9c1aa29bc09c48181a77413f2a75487315dbad7382aebef16cef6c36fb05b232", size = 4707248, upload-time = "2026-10-29T14:01:49.773Z" },
 ]
 
 [[package]]
@@ -40,7 +40,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agno", specifier = "==3.1.10" },
+    { name = "agno", specifier = "==3.1.12" },
     { name = "openai" },
     { name = "pytest" },
     { name = "sqlalchemy", extras = ["asyncio"] },
