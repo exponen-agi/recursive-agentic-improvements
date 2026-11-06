@@ -63,7 +63,7 @@ jobs:
         run: npm test
 
   version-sync:
-    name: version pins match docs
+    name: version pins + skill contract
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -73,4 +73,4 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Run version sync test
-        run: uv run --no-project --with pytest pytest tests/test_version_sync.py -v
+        run: uv run --no-project --with pytest pytest tests/test_version_sync.py tests/test_skill_contract.py -v
