@@ -13,9 +13,9 @@ Developers and collaborators can use these examples to:
 
 | Framework | Verified Version | Showcase Path | Run Command |
 |---|---|---|---|
-| **Agno** | 3.1.10 | `tests/agno/` | `python -m tests.agno.agent_test` |
-| **CrewAI** | 1.15.30 | `tests/crewai/` | `python -m tests.crewai.main` |
-| **LangGraph** | 1.2.18 | `tests/langgraph/` | `python -m tests.langgraph.run` |
+| **Agno** | 3.1.12 | `tests/agno/` | `python -m tests.agno.agent_test` |
+| **CrewAI** | 1.15.34 | `tests/crewai/` | `python -m tests.crewai.main` |
+| **LangGraph** | 1.2.19 | `tests/langgraph/` | `python -m tests.langgraph.run` |
 | **Google ADK** | 2.13.0 | `tests/google_adk/` | `python -m tests.google_adk.run` |
 
 ---
