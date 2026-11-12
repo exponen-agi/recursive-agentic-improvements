@@ -103,7 +103,7 @@ New-Item -ItemType Directory -Force .claude\commands | Out-Null
 Copy-Item <repo>\.claude\commands\*.md .claude\commands\
 ```
 
-The installer needs Node.js 18 or newer.
+The installer needs Node.js 22 or newer. Check with `node --version` (same command on macOS, Linux, and Windows PowerShell).
 
 ### Step 2: Configure Environment Variables
 Copy the `.env.example` file to `.env` and fill in your API keys:

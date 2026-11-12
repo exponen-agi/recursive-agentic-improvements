@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/exponen-agi/recursive-agentic-improvements/actions/workflows/ci.yml/badge.svg)](https://github.com/exponen-agi/recursive-agentic-improvements/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Node.js >=18](https://img.shields.io/badge/node-%3E%3D18-339933?logo=node.js&logoColor=white)](installer/package.json)
+[![Node.js >=22](https://img.shields.io/badge/node-%3E%3D22-339933?logo=node.js&logoColor=white)](installer/package.json)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-skills-D97757)](https://claude.com/claude-code)
 [![Frameworks](https://img.shields.io/badge/frameworks-Agno%20%7C%20CrewAI%20%7C%20LangGraph%20%7C%20Google%20ADK-blue)](#supported-frameworks)
 
@@ -143,7 +143,7 @@ Universal runbooks: [create](docs/create-new-agent.md) · [improve](docs/improve
 
 ## Install
 
-Run from inside your target project. Requires Node.js 18 or newer.
+Run from inside your target project. Requires Node.js 22 or newer (Node 18 and 20 are end-of-life and no longer get security fixes). Check with `node --version` — the command is the same on macOS, Linux, and Windows.
 
 ```bash
 # Claude Code (default) -> .claude/commands/
