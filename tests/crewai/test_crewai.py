@@ -68,6 +68,13 @@ class MockResponse:
         self.usage.prompt_tokens = prompt_tokens
         self.usage.completion_tokens = completion_tokens
         self.usage.total_tokens = prompt_tokens + completion_tokens
+        # crewai>=1.15.42 calls chat.completions.with_raw_response.create(), which
+        # returns our mock as-is; expose the raw-response API (.text, .http_response, .parse()).
+        self.text = ""
+        self.http_response = None
+
+    def parse(self):
+        return self
 
 @pytest.mark.behavioral
 @patch("openai.resources.chat.completions.Completions.create")
