@@ -1,4 +1,4 @@
-"""Checks that framework pins in tests/*/pyproject.toml match tests/README.md and CLAUDE.md."""
+"""Checks that framework pins in tests/*/pyproject.toml match tests/README.md, CLAUDE.md and README.md."""
 import re
 from pathlib import Path
 
@@ -14,7 +14,10 @@ def _pin(folder):
 def test_pins_match_docs_tables():
     readme = (ROOT / "tests" / "README.md").read_text(encoding="utf-8")
     claude = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for folder, name in PKGS.items():
         pin = _pin(folder)
         assert re.search(rf"\*\*{name}\*\* \| {re.escape(pin)} \|", readme), f"tests/README.md out of sync: {name}"
         assert re.search(rf"\| {name} \| {re.escape(pin)} \|", claude), f"CLAUDE.md out of sync: {name}"
+        # Root README "Supported frameworks" table drifted before; keep it pinned too.
+        assert re.search(rf"\| {name} \| {re.escape(pin)} \|", root_readme), f"README.md out of sync: {name}"
