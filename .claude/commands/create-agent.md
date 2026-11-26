@@ -400,7 +400,7 @@ def test_[slug]_agent_happy_path(mock_run):
 #### CREWAI — Structural Pattern
 
 ```bash
-crewai create crew <slug>
+crewai create crew <slug> --classic  # --classic = Python/YAML layout with crew.py; without it the CLI starts an interactive JSON-project wizard
 cd <slug>
 ```
 

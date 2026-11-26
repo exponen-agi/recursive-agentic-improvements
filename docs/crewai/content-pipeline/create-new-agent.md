@@ -35,7 +35,7 @@ Confirm with the user:
 ## Step 2 — Scaffold with CLI
 
 ```bash
-crewai create crew <pipeline-slug>
+crewai create crew <pipeline-slug> --classic
 cd <pipeline-slug>
 ```
 
