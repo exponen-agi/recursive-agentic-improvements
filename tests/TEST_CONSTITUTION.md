@@ -89,19 +89,33 @@ def test_crewai_happy_path():
 ```
 
 ### LangGraph
-Use LangChain's built-in `GenericFakeChatModel` to script exact sequence responses (text/tool calls):
+Use LangChain's built-in `GenericFakeChatModel` to script exact sequence responses (text/tool calls).
+Import it from `langchain_core` (always installed with `langchain`), not `langchain_community` (a separate, optional package).
+`create_agent` calls `bind_tools()`, which `GenericFakeChatModel` does not implement, so subclass it.
+Each model call returns the next scripted message, so the test walks the whole loop with no API key:
+```mermaid
+flowchart LR
+    U["HumanMessage"] --> M1["fake model, reply 1:<br/>tool call"]
+    M1 --> T["your real tool runs"]
+    T --> M2["fake model, reply 2:<br/>final answer"]
+    M2 --> A["assert ToolMessage + answer"]
+```
 ```python
-from langchain_community.chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage, ToolCall
+
+class FakeToolCallingModel(GenericFakeChatModel):
+    def bind_tools(self, tools, **kwargs):
+        return self
 
 def test_langgraph_happy_path():
-    fake_llm = GenericFakeChatModel(
-        messages=[
-            AIMessage(content="Routing to tools...", additional_kwargs={"tool_calls": [...]}),
-            AIMessage(content="The product of 12 and 9 is 108.")
-        ]
+    fake_llm = FakeToolCallingModel(
+        messages=iter([
+            AIMessage(content="", tool_calls=[ToolCall(name="multiply_numbers", args={"a": 12, "b": 9}, id="call_1")]),
+            AIMessage(content="The product of 12 and 9 is 108."),
+        ])
     )
-    # Instantiate or patch graph with fake_llm
+    # Pass fake_llm as the model to create_agent(...)
 ```
 
 ### Google ADK
