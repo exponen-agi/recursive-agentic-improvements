@@ -34,7 +34,7 @@ Confirm with the user:
 Use the CrewAI CLI to scaffold:
 
 ```bash
-crewai create crew <crew-slug>
+crewai create crew <crew-slug> --classic
 cd <crew-slug>
 ```
 

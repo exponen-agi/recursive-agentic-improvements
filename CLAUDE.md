@@ -594,7 +594,7 @@ Update this table whenever a framework is added, removed, or a minimum version c
 | Framework | Min version tested | Docs source | MCP URL | Key note |
 |---|---|---|---|---|
 | Agno | 3.1.12 | MCP + llms-full.txt | `https://docs.agno.com/mcp` | Use `Claude(id=...)` for Anthropic models; Agno 3.0 renamed some toolkit/memory params but `SqliteDb` + `add_history_to_context` are unchanged (see its v2→v3 migration guide) |
-| CrewAI | 1.15.34 | MCP + llms.txt | `https://docs.crewai.com/mcp` | `crewai create crew <slug>` to scaffold |
+| CrewAI | 1.15.34 | MCP + llms.txt | `https://docs.crewai.com/mcp` | `crewai create crew <slug> --classic` to scaffold (`--classic` gives the `crew.py` + YAML layout) |
 | LangGraph | 1.2.19 | MCP + llms.txt | `https://docs.langchain.com/mcp` | `create_react_agent` moved to `langchain.agents.create_agent` (V1.0+); requires `LANGSMITH_API_KEY` for tracing |
 | Google ADK | 2.13.0 | Context7 (`/google/adk-python`) + WebFetch llms.txt | `https://mcp.context7.com/mcp` (general-purpose, no ADK-dedicated server exists) | `root_agent` must be defined in `agent.py`; ADK 1.0+ also supports the A2A (Agent2Agent) protocol natively for cross-framework agent-to-agent calls |
 

@@ -400,7 +400,7 @@ def test_[slug]_agent_happy_path(mock_run):
 #### CREWAI — Structural Pattern
 
 ```bash
-crewai create crew <slug>
+crewai create crew <slug> --classic  # --classic = Python/YAML layout with crew.py; without it the CLI starts an interactive JSON-project wizard
 cd <slug>
 ```
 
@@ -534,9 +534,14 @@ For Supervisor pattern: create `state.py`, `supervisor.py`, individual agent fil
 import pytest
 from langchain.agents import create_agent
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain_community.chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
 from src.<slug>.tools import [all custom tools]
+
+class FakeToolCallingModel(GenericFakeChatModel):
+    # GenericFakeChatModel has no bind_tools; create_agent calls it when tools are passed
+    def bind_tools(self, tools, **kwargs):
+        return self
 
 @pytest.mark.static
 def test_[slug]_graph_static():
@@ -548,27 +553,16 @@ def test_[slug]_graph_static():
 @pytest.mark.behavioral
 def test_[slug]_graph_happy_path():
     """Verify happy path graph execution routing using GenericFakeChatModel."""
-    fake_llm = GenericFakeChatModel(
-        messages=[
+    fake_llm = FakeToolCallingModel(
+        messages=iter([
             AIMessage(
                 content="",
-                additional_kwargs={
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "function": {
-                                "name": "[primary_tool_name]",
-                                "arguments": "[mock_args]"
-                            },
-                            "type": "function"
-                        }
-                    ]
-                }
+                tool_calls=[ToolCall(name="[primary_tool_name]", args=[mock_args_dict], id="call_1")],
             ),
-            AIMessage(content="[Expected Response]")
-        ]
+            AIMessage(content="[Expected Response]"),
+        ])
     )
-    
+
     test_graph = create_agent(
         model=fake_llm,
         tools=[[all custom tools]],
